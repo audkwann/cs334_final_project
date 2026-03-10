@@ -68,9 +68,9 @@ sad_emotions = ["boredom2", "sad1", "resigned1", "displeased1", "irritated2",
                 "displeased2","go_away1"]
 
 # --- Emotion rule setup (chosen once per run) ---
-TECH_KEYWORDS = ["phone", "mouse", "cell", "camera", "pink object", "white box", "white square"]
+TECH_KEYWORDS = ["phone", "mouse", "cell", "camera", "pink object", "blue object", "white box", "white square"]
 PAPER_KEYWORDS = ["paper", "newspaper", "magazine", "book", "document", "check", "card"]
-FOOD_KEYWORDS = ["apple", "orange", "food", "fruit", "can", "soda", "bottle", "coca", "cola"]
+FOOD_KEYWORDS = ["apple", "orange", "lemon", "food", "fruit", "can", "soda", "bottle", "coca", "cola"]
 
 EMOTION_RULES = ["likes_tech", "likes_paper", "likes_food"]
 
