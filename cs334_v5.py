@@ -5,18 +5,37 @@ from PIL import Image
 from transformers import BlipProcessor, BlipForConditionalGeneration
 import subprocess
 import random
-from reachy_mini import ReachyMini
-from reachy_mini.utils import create_head_pose
-from reachy_mini.utils.interpolation import InterpolationTechnique
+import sys
+import threading
+try:
+    from reachy_mini import ReachyMini
+    from reachy_mini.utils import create_head_pose
+    from reachy_mini.utils.interpolation import InterpolationTechnique
+except ModuleNotFoundError:
+    print("reachy_mini not installed — Reachy features disabled.")
+
+try:
+    import serial
+    from serial.tools import list_ports
+except ModuleNotFoundError:
+    print("Missing dependency: pyserial. Install it with `pip install pyserial`.")
+    sys.exit(1)
 
 """
 Reachy generates a caption and reacts when you press SPACE on the keyboard.
 """
 
 REACHY_API = "http://localhost:8000"
+
+# Encoder / position constants (must match pulley.ino)
+TICKS_PER_REV = 16567
+NUM_ZONES = 4  # 4 zones = 90-degree increments
 TRIGGER_KEY = ord(" ")  # SPACE bar - press in the OpenCV window to capture and react
 
 def play_emotion(emotion_name: str):
+    if not reachy_available:
+        print(f"[skip] Would play emotion: {emotion_name}")
+        return
     dataset_name = "pollen-robotics%2Freachy-mini-emotions-library"
     url = f"{REACHY_API}/api/move/play/recorded-move-dataset/{dataset_name}/{emotion_name}"
     try:
@@ -37,8 +56,92 @@ def check_api_health():
         return False
 
 # --- Setup ---
-if not check_api_health():
-    exit(1)
+reachy_available = check_api_health()
+if not reachy_available:
+    print("Continuing without Reachy — motor control still available.")
+
+# --- Serial motor setup ---
+def find_arduino_port():
+    ports = sorted(list_ports.comports(), key=lambda p: p.device)
+    for p in ports:
+        if p.device.startswith(("/dev/tty.usb", "/dev/cu.usb")) or "arduino" in (p.description or "").lower():
+            return p.device
+    print("No Arduino serial port found. Available ports:")
+    for p in ports:
+        print(f"  {p.device} - {p.description or 'Unknown'}")
+    return None
+
+arduino_port = find_arduino_port()
+ser = None
+
+# Shared encoder position (updated by serial reader thread)
+_encoder_position = 0
+_encoder_lock = threading.Lock()
+_serial_stop = threading.Event()
+
+if arduino_port:
+    try:
+        ser = serial.Serial(arduino_port, 115200, timeout=0.25)
+        print(f"Opened {arduino_port} — waiting for Arduino reset...")
+        time.sleep(2.0)
+
+        # Background thread to print Arduino responses and parse POS messages
+        def _serial_reader():
+            global _encoder_position
+            while not _serial_stop.is_set():
+                try:
+                    line = ser.readline()
+                except serial.SerialException:
+                    return
+                if line:
+                    msg = line.decode("utf-8", errors="replace").strip()
+                    if msg:
+                        if msg.startswith("POS "):
+                            try:
+                                with _encoder_lock:
+                                    _encoder_position = int(msg[4:])
+                            except ValueError:
+                                pass
+                        elif msg.startswith("REACHED "):
+                            print(f"[arduino] {msg}")
+                        elif msg.startswith("ZEROED"):
+                            with _encoder_lock:
+                                _encoder_position = 0
+                            print(f"[arduino] {msg}")
+                        else:
+                            print(f"[arduino] {msg}")
+        threading.Thread(target=_serial_reader, daemon=True).start()
+    except serial.SerialException as exc:
+        print(f"Failed to open {arduino_port}: {exc}")
+        ser = None
+else:
+    print("Motor control disabled (no Arduino found).")
+
+def send_motor_command(cmd: str):
+    """Send a single-char command ('1','2','3') to the Arduino."""
+    if ser and ser.is_open:
+        ser.write(f"{cmd}\n".encode("ascii"))
+        ser.flush()
+        labels = {"1": "LEFT", "2": "RIGHT", "3": "STOP"}
+        print(f"Motor: sent {labels.get(cmd, cmd)}")
+    else:
+        print(f"Motor: no serial connection (would send '{cmd}')")
+
+def get_encoder_position():
+    """Return the latest encoder position from the Arduino."""
+    with _encoder_lock:
+        return _encoder_position
+
+def send_goto_position(zone):
+    """Send a go-to-position command for the given zone number (0-based)."""
+    target_ticks = zone * (TICKS_PER_REV // NUM_ZONES)
+    if ser and ser.is_open:
+        cmd = f"g{target_ticks}\n"
+        ser.write(cmd.encode("ascii"))
+        ser.flush()
+        print(f"Motor: goto zone {zone} (ticks={target_ticks})")
+    else:
+        print(f"Motor: no serial connection (would goto zone {zone}, ticks={target_ticks})")
 
 cap = cv2.VideoCapture(0)
 
@@ -83,7 +186,7 @@ EMOTION_RULE_DESCRIPTIONS = {
 EMOTION_RULE_DESCRIPTION = EMOTION_RULE_DESCRIPTIONS[EMOTION_RULE]
 
 print(f"Using emotion rule for this run: {EMOTION_RULE_DESCRIPTION}")
-print(f"Press SPACE to capture the current frame and make Reachy caption + react. Press 'q' to quit.")
+print(f"Controls: SPACE=caption | 1/2/3=left/right/stop | 4-7=zone positions | p=position z=zero | y/n=mood | q=quit")
 
 
 def decide_emotion_from_caption(caption: str):
@@ -161,7 +264,7 @@ try:
 
         # Show what Reachy sees
         display = frame.copy()
-        status = "Press SPACE in this window to capture & react | q to quit"
+        status = "SPACE=caption | 1=left 2=right 3=stop | 4-7=zones | p=pos z=zero | y/n=mood | q=quit"
         cv2.putText(display, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(display, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
         cv2.imshow("Reachy's view", display)
@@ -187,11 +290,42 @@ try:
             react_with_mood("sad")
             last_reaction_time = current_time
 
+        # Motor controls: 1=left, 2=right, 3=stop
+        elif key == ord("1"):
+            send_motor_command("1")
+        elif key == ord("2"):
+            send_motor_command("2")
+        elif key == ord("3"):
+            send_motor_command("3")
+
+        # Zone go-to: 4=zone0(0deg), 5=zone1(90deg), 6=zone2(180deg), 7=zone3(270deg)
+        elif key == ord("4"):
+            send_goto_position(0)
+        elif key == ord("5"):
+            send_goto_position(1)
+        elif key == ord("6"):
+            send_goto_position(2)
+        elif key == ord("7"):
+            send_goto_position(3)
+
+        # Encoder commands
+        elif key == ord("p"):
+            pos = get_encoder_position()
+            degrees = (pos / TICKS_PER_REV) * 360.0
+            print(f"Encoder position: {pos} ticks ({degrees:.1f} degrees)")
+        elif key == ord("z"):
+            send_motor_command("z")
+            print("Encoder zeroed (home set)")
+
         if key == ord("q"):
             break
 
 except KeyboardInterrupt:
     print("Stopping...")
 finally:
+    if ser and ser.is_open:
+        send_motor_command("3")  # stop motor on exit
+        _serial_stop.set()
+        ser.close()
     cap.release()
     cv2.destroyAllWindows()
