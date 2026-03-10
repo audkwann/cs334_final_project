@@ -3,10 +3,17 @@ import time
 import requests
 from PIL import Image
 from transformers import BlipProcessor, BlipForConditionalGeneration
-import subprocess
+import os
 import random
 import sys
 import threading
+
+try:
+    import speech_recognition as sr
+    _speech_available = True
+except ModuleNotFoundError:
+    _speech_available = False
+    print("speech_recognition not installed — voice input disabled. Install with: pip install SpeechRecognition pyaudio")
 try:
     from reachy_mini import ReachyMini
     from reachy_mini.utils import create_head_pose
@@ -51,7 +58,7 @@ def check_api_health():
         r = requests.get(f"{REACHY_API}/", timeout=3)
         print("✓ Reachy API is reachable")
         return True
-    except requests.exceptions.ConnectionError:
+    except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout, requests.exceptions.Timeout):
         print("✗ Cannot reach Reachy API at localhost:8000 — is the robot connected?")
         return False
 
@@ -166,9 +173,187 @@ model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-capt
 
 happy_emotions = ["loving1", "dance3", "proud3", "proud2", "success1", "enthusiastic2", "success2", "enthusiastic1", 
                   "proud1", "grateful1", "yes1", "dance1", "welcoming2", "cheerful1"]
-sad_emotions = ["boredom2", "sad1", "resigned1", "displeased1", "irritated2", 
+sad_emotions = ["boredom2", "sad1", "resigned1", "displeased1", "irritated2",
                 "rage1","no1","reprimand3","reprimand2","reprimand1", "frustrated1","irritated1",
                 "displeased2","go_away1"]
+thinking_emotions = ["thoughtful1", "thoughtful2", "curious1", "inquiring1", "inquiring2",
+                     "uncertain1", "confused1", "attentive1", "attentive2"]
+
+QUARTER_REV_TICKS = TICKS_PER_REV // 4  # 90 degrees = ~4141 ticks
+
+# --- Question sequence helpers ---
+
+def send_goto_ticks(ticks):
+    """Send a go-to-position command for an absolute tick value."""
+    if ser and ser.is_open:
+        ser.write(f"g{ticks}\n".encode("ascii"))
+        ser.flush()
+
+def send_motor_quiet(cmd):
+    """Send motor command without printing (for animation sequences)."""
+    if ser and ser.is_open:
+        ser.write(f"{cmd}\n".encode("ascii"))
+        ser.flush()
+
+def ask_llm_yes_no(question, caption):
+    """Ask OpenAI GPT-4o-mini for a yes/no answer."""
+    try:
+        from openai import OpenAI
+
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            print("[llm] No OPENAI_API_KEY set, answering randomly")
+            return random.choice(["yes", "no"])
+
+        client = OpenAI(api_key=api_key)
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=10,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"You are a playful robot named Reachy. Someone is showing you an object "
+                    f"and asking a yes/no question.\n"
+                    f"The camera sees: '{caption}'.\n"
+                    f"The question is: '{question}'.\n"
+                    f"Answer with exactly one word: YES or NO."
+                )
+            }]
+        )
+
+        answer_text = response.choices[0].message.content.strip().upper()
+        result = "yes" if "YES" in answer_text else "no"
+        print(f"[llm] GPT-4o-mini says: {answer_text} -> {result}")
+        return result
+
+    except Exception as e:
+        print(f"[llm] Error calling OpenAI: {e}, answering randomly")
+        return random.choice(["yes", "no"])
+
+_question_active = False
+
+def perform_question_sequence(answer):
+    """Thinking animation + decision + return. Runs in a background thread."""
+    global _question_active
+    _question_active = True
+
+    try:
+        # Phase 1: Thinking wobble (~10 seconds)
+        # Gentle random direction changes with thinking emotions
+        print("[thinking] Reachy is pondering...")
+        think_start = time.time()
+        think_duration = 10.0
+        last_emotion_time = 0
+
+        while True:
+            elapsed = time.time() - think_start
+            remaining = think_duration - elapsed
+            if remaining <= 0:
+                break
+
+            # Play a thinking emotion every ~2.5 seconds
+            if elapsed - last_emotion_time > 2.5:
+                play_emotion(random.choice(thinking_emotions))
+                last_emotion_time = elapsed
+
+            # Gentle wobble: random direction for a short time
+            direction = random.choice(["1", "2"])
+            move_time = random.uniform(0.8, 1.8)
+            send_motor_quiet(direction)
+            time.sleep(min(move_time, max(0.1, remaining - 0.3)))
+
+            # Brief pause between movements
+            send_motor_quiet("3")
+            remaining = think_duration - (time.time() - think_start)
+            if remaining > 0.4:
+                time.sleep(random.uniform(0.2, 0.5))
+
+        # Phase 2: Decision — stop, then glide to the answer position
+        send_motor_quiet("3")
+        time.sleep(0.5)
+
+        if answer == "yes":
+            target = QUARTER_REV_TICKS
+            print(f"[decided] YES -> going to +90 degrees (ticks={target})")
+            play_emotion(random.choice(happy_emotions))
+        else:
+            target = -QUARTER_REV_TICKS
+            print(f"[decided] NO -> going to -90 degrees (ticks={target})")
+            play_emotion(random.choice(sad_emotions))
+
+        # Arduino goto handles gradual slowdown near target
+        send_goto_ticks(target)
+
+        # Wait at the decision position
+        time.sleep(5.0)
+
+        # Phase 3: Return home
+        print("[returning] Going back to home position...")
+        send_goto_ticks(0)
+        time.sleep(5.0)
+
+        print("[done] Question sequence complete.")
+    finally:
+        _question_active = False
+
+def listen_for_question():
+    """Listen via microphone and return transcribed text, or None on failure."""
+    if not _speech_available:
+        print("[speech] speech_recognition not available, falling back to text input")
+        return input("Ask Reachy a yes/no question: ").strip() or None
+
+    recognizer = sr.Recognizer()
+    recognizer.energy_threshold = 300
+    recognizer.dynamic_energy_threshold = True
+
+    try:
+        with sr.Microphone() as source:
+            print("[listening] Speak your yes/no question now...")
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            audio = recognizer.listen(source, timeout=8, phrase_time_limit=10)
+
+        print("[processing] Transcribing speech...")
+        text = recognizer.recognize_google(audio)
+
+        print(f"[heard] \"{text}\"")
+        return text.strip() if text.strip() else None
+
+    except sr.WaitTimeoutError:
+        print("[speech] No speech detected (timed out)")
+        return None
+    except sr.UnknownValueError:
+        print("[speech] Could not understand audio")
+        return None
+    except sr.RequestError as e:
+        print(f"[speech] Recognition service error: {e}")
+        return None
+
+def start_question_sequence(frame):
+    """Capture a frame, listen for a spoken question, ask LLM, then animate."""
+    global _question_active
+    if _question_active:
+        print("Question sequence already running, please wait.")
+        return
+
+    # Get the caption from BLIP
+    img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    inputs = processor(images=img, return_tensors="pt")
+    out = model.generate(**inputs)
+    caption = processor.decode(out[0], skip_special_tokens=True)
+    print(f"[caption] Camera sees: {caption}")
+
+    # Listen for spoken question
+    question = listen_for_question()
+    if not question:
+        print("No question received, cancelled.")
+        return
+
+    print(f"[question] '{question}' — asking GPT-4o-mini...")
+    answer = ask_llm_yes_no(question, caption)
+
+    # Run the animation in a background thread so the video loop keeps running
+    threading.Thread(target=perform_question_sequence, args=(answer,), daemon=True).start()
 
 # --- Emotion rule setup (chosen once per run) ---
 TECH_KEYWORDS = ["phone", "mouse", "cell", "camera", "pink object", "blue object", "white box", "white square"]
@@ -186,7 +371,7 @@ EMOTION_RULE_DESCRIPTIONS = {
 EMOTION_RULE_DESCRIPTION = EMOTION_RULE_DESCRIPTIONS[EMOTION_RULE]
 
 print(f"Using emotion rule for this run: {EMOTION_RULE_DESCRIPTION}")
-print(f"Controls: SPACE=caption | 1/2/3=left/right/stop | 4-7=zone positions | p=position z=zero | y/n=mood | q=quit")
+print(f"Controls: SPACE=caption | a=ask question | 1/2/3=left/right/stop | 4-7=zones | p=pos z=zero | y/n=mood | q=quit")
 
 
 def decide_emotion_from_caption(caption: str):
@@ -207,16 +392,11 @@ def decide_emotion_from_caption(caption: str):
         return random.choice(sad_emotions), "sad"
 
 def react_with_mood(mood: str):
-    """Make Reachy react with a happy or sad emotion and matching speech."""
-    happy_sayings = ["Yay, I like this! Please place this object on the circle below.", "I want this! Please place this object on the circle below.", "I love this! Please place this object on the circle below."]
-    sad_sayings = ["I do not like this.", "Don't show this to me again.", "Gross. Take this away.", "I hate this.", "I don't want this. Take it away.", "Why would you give me this? Take it away."]
-
+    """Make Reachy react with a happy or sad emotion."""
     if mood == "happy":
         emotion_name = random.choice(happy_emotions)
-        subprocess.run(["say", random.choice(happy_sayings)])
     else:
         emotion_name = random.choice(sad_emotions)
-        subprocess.run(["say", "-v", "Ralph", random.choice(sad_sayings)])
 
     print(f"Manual trigger | Mood: {mood} | Emotion: {emotion_name}")
     play_emotion(emotion_name)
@@ -244,14 +424,6 @@ def generate_caption(frame, bbox=None):
     emotion_name, mood = decide_emotion_from_caption(caption)
     print(f"Emotion rule: {EMOTION_RULE_DESCRIPTION} | Mood: {mood} | Emotion: {emotion_name}")
 
-    happy_sayings = ["Yay, I like this! Please place this object on the circle below.", "I want this! Please place this object on the circle below.", "I love this! Please place this object on the circle below."]
-    sad_sayings = ["I do not like this.", "Don't show this to me again.", "Gross. Take this away.", "I hate this.", "I don't want this. Take it away.", "Why would you give me this? Take it away."]
-
-    if mood == "happy":
-        subprocess.run(["say", random.choice(happy_sayings)])
-    else:
-        subprocess.run(["say", "-v", "Ralph", random.choice(sad_sayings)])
-
     play_emotion(emotion_name)
 
 
@@ -264,7 +436,7 @@ try:
 
         # Show what Reachy sees
         display = frame.copy()
-        status = "SPACE=caption | 1=left 2=right 3=stop | 4-7=zones | p=pos z=zero | y/n=mood | q=quit"
+        status = "SPACE=caption | a=ask | 1/2/3=motor | 4-7=zones | p=pos z=zero | y/n=mood | q=quit"
         cv2.putText(display, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(display, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
         cv2.imshow("Reachy's view", display)
@@ -277,7 +449,12 @@ try:
             print("Key pressed - capturing frame and reacting...")
             generate_caption(frame, bbox=None)
             last_reaction_time = current_time
-        
+
+        # Ask Reachy a yes/no question (captures frame, prompts in terminal, thinks, answers)
+        elif key == ord("a") and not _question_active:
+            start_question_sequence(frame)
+            last_reaction_time = current_time
+
         # Trigger on 'y': manually force Reachy to be happy
         elif key == ord("y") and (current_time - last_reaction_time > COOLDOWN):
             print("'y' pressed - making Reachy happy...")
