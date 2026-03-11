@@ -4,12 +4,12 @@ Ouija Board - A mystical spirit communication interface using a rotating table.
 
 The table spells out responses letter-by-letter as an ancient spirit answers questions.
 
-Physical layout (30 segments, 12 degrees each):
-  Segment 0:     (blank/unused)
-  Segments 1-26: A-Z
-  Segment 27:    NO
-  Segment 28:    GOODBYE
-  Segment 29:    YES
+Layout (30 segments, 12 degrees each):
+  Segment 0:  (blank)
+  Segments 1-26: A through Z
+  Segment 27: NO
+  Segment 28: GOODBYE
+  Segment 29: YES
 """
 
 import os
@@ -45,19 +45,19 @@ try:
 except ModuleNotFoundError:
     _requests_available = False
 
-
 # --- Constants ---
-
 TICKS_PER_REV = 16567
 NUM_SEGMENTS = 30
-TICKS_PER_SEGMENT = TICKS_PER_REV // NUM_SEGMENTS  # ~552 ticks
-LETTER_PAUSE = 2.0  # seconds to pause at each position
+TICKS_PER_SEGMENT = TICKS_PER_REV // NUM_SEGMENTS  # ~552
+LETTER_PAUSE = 2.0  # seconds to pause at each letter
+BLANK_SEGMENT = 0   # unused slot at position 0
 
-# Segment assignments
-BLANK_SEGMENT = 0
-NO_SEGMENT = 27
-GOODBYE_SEGMENT = 28
-YES_SEGMENT = 29
+# --- LED Color Constants ---
+LED_IDLE = (255, 0, 0)          # red/orange, solid (no breathing)
+LED_SPIRIT = (220, 0, 0)       # red/orange, breathing
+LED_THINKING = (255, 40, 0)     # red/orange, breathing
+LED_MOVING = (255, 40, 0)       # red/orange, breathing
+LED_AT_LETTER = (255, 255, 255)  # white, solid (no breathing)
 
 REACHY_API = "http://localhost:8000"
 
@@ -66,46 +66,39 @@ thinking_emotions = [
     "uncertain1", "confused1", "attentive1", "attentive2"
 ]
 
-
 # --- Segment Mapping ---
 
 def char_to_segment(char: str) -> int:
-    """Map a single letter or special word to its board segment.
+    """Map a character or special word to its segment number (0-29).
 
-    Segment layout:
-      0     -> blank/unused
-      1-26  -> A-Z
-      27    -> NO
-      28    -> GOODBYE
-      29    -> YES
-
-    Returns:
-        Segment index (0-29), or -1 if the input is invalid.
+    Layout (30 segments):
+      0: (blank)
+      1-26: A-Z
+      27: NO, 28: GOODBYE, 29: YES
     """
-    char = char.upper().strip()
-
+    char = char.upper()
     if char == "YES":
-        return YES_SEGMENT
+        return 29
     if char == "GOODBYE":
-        return GOODBYE_SEGMENT
+        return 28
     if char == "NO":
-        return NO_SEGMENT
-    if len(char) == 1 and 'A' <= char <= 'Z':
-        return ord(char) - ord('A') + 1
-    return -1
+        return 27
+    if 'A' <= char <= 'Z':
+        return 1 + (ord(char) - ord('A'))
+    return -1  # invalid character
 
 
 def segment_to_label(segment: int) -> str:
-    """Return the display label for a segment."""
-    if segment == BLANK_SEGMENT:
+    """Return the label for a segment (for display purposes)."""
+    if segment == 0:
         return "(blank)"
     if 1 <= segment <= 26:
-        return chr(ord('A') + segment - 1)
-    if segment == NO_SEGMENT:
+        return chr(ord('A') + (segment - 1))
+    if segment == 27:
         return "NO"
-    if segment == GOODBYE_SEGMENT:
+    if segment == 28:
         return "GOODBYE"
-    if segment == YES_SEGMENT:
+    if segment == 29:
         return "YES"
     return "?"
 
@@ -158,6 +151,7 @@ ser = None
 _encoder_position = 0
 _encoder_lock = threading.Lock()
 _serial_stop = threading.Event()
+_reached_event = threading.Event()
 
 if arduino_port:
     try:
@@ -182,6 +176,7 @@ if arduino_port:
                             except ValueError:
                                 pass
                         elif msg.startswith("REACHED "):
+                            _reached_event.set()
                             print(f"  [motor] {msg}")
                         elif msg.startswith("ZEROED"):
                             with _encoder_lock:
@@ -202,21 +197,27 @@ def send_serial(cmd: str):
         ser.flush()
 
 
+def set_led_color(r: int, g: int, b: int, breathe: bool = True):
+    """Set all NeoPixel LEDs to the given color, with optional breathing."""
+    send_serial(f"b{'1' if breathe else '0'}")
+    send_serial(f"c{r},{g},{b}")
+
+
 def get_position() -> int:
     with _encoder_lock:
         return _encoder_position
 
 
 def goto_ticks(ticks: int):
+    _reached_event.clear()
     send_serial(f"g{ticks}")
 
 
 def shortest_target_ticks_for_segment(segment: int, current_ticks: int) -> int:
-    """Return the equivalent absolute tick target for a segment using the shortest wraparound path.
+    """Return the absolute tick target for a segment using the shortest wraparound path.
 
-    A circular position can be represented by many equivalent absolute tick values
-    separated by +/- TICKS_PER_REV. We choose the one closest to the current encoder
-    position so the table takes the shortest path.
+    We pick from base +/- TICKS_PER_REV whichever is closest to the current
+    encoder position so the table takes the shortest route.
     """
     base_ticks = (segment % NUM_SEGMENTS) * TICKS_PER_SEGMENT
 
@@ -230,11 +231,7 @@ def shortest_target_ticks_for_segment(segment: int, current_ticks: int) -> int:
 
 
 def goto_segment(segment: int) -> int:
-    """Move to a specific segment using the shortest circular path.
-
-    Returns:
-        The absolute target tick position that was commanded.
-    """
+    """Move to a specific segment using the shortest circular path. Returns target ticks."""
     segment = segment % NUM_SEGMENTS
     current_ticks = get_position()
     target_ticks = shortest_target_ticks_for_segment(segment, current_ticks)
@@ -249,16 +246,28 @@ def goto_segment(segment: int) -> int:
     return target_ticks
 
 
-def wait_for_position(target_ticks: int, timeout: float = 10.0) -> bool:
-    """Block until the motor reaches the target position within tolerance."""
-    tolerance = TICKS_PER_SEGMENT // 4
-    start = time.time()
-    while time.time() - start < timeout:
-        pos = get_position()
-        if abs(pos - target_ticks) <= tolerance:
-            return True
-        time.sleep(0.1)
-    return False
+def wait_for_arrival(timeout: float = 15.0) -> bool:
+    """Block until the Arduino reports REACHED for the current goto command."""
+    return _reached_event.wait(timeout=timeout)
+
+
+# --- Keyboard Input ---
+
+def wait_for_key(key: str):
+    """Block until the specified key is pressed (no Enter needed)."""
+    import tty, termios
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == key:
+                return
+            if ch == '\x03':  # Ctrl+C
+                raise KeyboardInterrupt
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 # --- Speech Recognition ---
@@ -353,6 +362,7 @@ def ask_spirit(question: str) -> str:
         )
 
         answer = response.choices[0].message.content.strip().upper()
+        # Clean: only keep A-Z
         answer = ''.join(c for c in answer if 'A' <= c <= 'Z')
         if not answer:
             answer = "SILENCE"
@@ -367,28 +377,49 @@ def ask_spirit(question: str) -> str:
 # --- Spelling ---
 
 def spell_word(word: str, pause: float = LETTER_PAUSE):
-    """Spell a response by moving to either a special segment or letter segments."""
+    """Spell out a word by moving to each letter's segment."""
     word = word.upper().strip()
-    cleaned = ''.join(c for c in word if 'A' <= c <= 'Z')
+    # Clean: only keep valid characters
+    word = ''.join(c for c in word if 'A' <= c <= 'Z')
 
-    if not cleaned:
+    if not word:
         return
 
-    if cleaned in {"YES", "NO", "GOODBYE"}:
-        print(f"\n  Spelling: {cleaned}")
-        seg = char_to_segment(cleaned)
-        target = goto_segment(seg)
-        wait_for_position(target)
+    # Check for special words that are single segments
+    if word == "YES":
+        print("\n  Spelling: YES")
+        goto_segment(char_to_segment("YES"))
+        wait_for_arrival()
+        set_led_color(*LED_AT_LETTER, breathe=False)
         time.sleep(pause)
         return
 
-    print(f"\n  Spelling: {cleaned}")
-    for i, char in enumerate(cleaned):
+    if word == "NO":
+        print("\n  Spelling: NO")
+        goto_segment(char_to_segment("NO"))
+        wait_for_arrival()
+        set_led_color(*LED_AT_LETTER, breathe=False)
+        time.sleep(pause)
+        return
+
+    if word == "GOODBYE":
+        print("\n  Spelling: GOODBYE")
+        goto_segment(char_to_segment("GOODBYE"))
+        wait_for_arrival()
+        set_led_color(*LED_AT_LETTER, breathe=False)
+        time.sleep(pause)
+        return
+
+    # Spell letter by letter
+    print(f"\n  Spelling: {word}")
+    for i, char in enumerate(word):
         seg = char_to_segment(char)
         if seg >= 0:
-            print(f"  [{i + 1}/{len(cleaned)}] {char}", end="", flush=True)
-            target = goto_segment(seg)
-            wait_for_position(target)
+            print(f"  [{i+1}/{len(word)}] {char}", end="", flush=True)
+            set_led_color(*LED_MOVING)
+            goto_segment(seg)
+            wait_for_arrival()
+            set_led_color(*LED_AT_LETTER, breathe=False)
             print(" ... done")
             time.sleep(pause)
 
@@ -402,49 +433,65 @@ def ouija_session():
     print("       OUIJA BOARD - SPIRIT COMMUNICATION")
     print("=" * 50)
     print()
-    print("The board awaits your questions...")
-    print("Say 'goodbye' or press Ctrl+C to end the session.")
+    print("Press 's' to summon the spirits.")
+    print("Press Ctrl+C to end the session.")
     print()
 
     session_active = True
 
     while session_active:
         try:
+            # --- IDLE: solid red, waiting for 's' ---
+            set_led_color(*LED_IDLE, breathe=False)
+            print("[idle] Press 's' to summon the spirits...")
+            wait_for_key('s')
+
+            # --- SPIRIT: breathing red, listening ---
+            set_led_color(*LED_SPIRIT)
             question = listen_for_question()
             if not question:
                 print("The spirits did not hear you. Try again.")
                 continue
 
+            # Check for goodbye
             if "goodbye" in question.lower() or "bye" in question.lower():
                 print("\n[session] Ending session...")
                 spell_word("GOODBYE")
+                set_led_color(*LED_IDLE, breathe=False)
                 print("\nThe spirits depart. Farewell.")
                 break
 
+            # --- THINKING: breathing red ---
+            set_led_color(*LED_THINKING)
             print("\n[thinking] The spirits are contemplating...")
             play_emotion(random.choice(thinking_emotions))
             time.sleep(1.5)
 
+            # Ask the spirit
             response = ask_spirit(question)
+
+            # --- MOVING / AT_LETTER handled inside spell_word ---
             spell_word(response)
 
-            print("\n  The spirits await your next question...\n")
+            # Brief pause before returning to idle
+            print("\n  The spirits have spoken.\n")
             time.sleep(1.0)
 
         except KeyboardInterrupt:
             print("\n\n[session] Interrupted (Ctrl-C). Saying goodbye, then returning to segment 0...")
             spell_word("GOODBYE")
-            target = goto_segment(BLANK_SEGMENT)
+            set_led_color(*LED_IDLE, breathe=False)
+            goto_segment(0)
             if ser and ser.is_open:
-                wait_for_position(target, timeout=15.0)
+                wait_for_arrival(timeout=15.0)
             session_active = False
 
 
 def print_segment_map():
-    """Print the full board segment layout."""
+    """Print the Ouija board segment layout."""
     print()
-    print("Ouija Board Segment Map (30 segments):")
-    print("-" * 48)
+    print("Ouija Board Segment Map (29 segments):")
+    print("-" * 40)
     for seg in range(NUM_SEGMENTS):
         label = segment_to_label(seg)
         ticks = seg * TICKS_PER_SEGMENT
@@ -461,7 +508,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ouija Board Spirit Communication")
     parser.add_argument("--map", action="store_true", help="Print segment map and exit")
     parser.add_argument("--test", type=str, metavar="WORD", help="Test spelling a word")
-    parser.add_argument("--segment", type=int, metavar="N", help="Go to segment N (0-29)")
+    parser.add_argument("--segment", type=int, metavar="N", help="Go to segment N (0-28)")
     args = parser.parse_args()
 
     if args.map:
@@ -485,11 +532,13 @@ if __name__ == "__main__":
     try:
         ouija_session()
     except KeyboardInterrupt:
+        # In case Ctrl-C happens outside the session loop (e.g., during listen/spell),
+        # ensure we still say goodbye and return to home.
         print("\n\nInterrupted (Ctrl-C). Saying goodbye, then returning to segment 0...")
         spell_word("GOODBYE")
-        target = goto_segment(BLANK_SEGMENT)
+        goto_segment(0)
         if ser and ser.is_open:
-            wait_for_position(target, timeout=15.0)
+            wait_for_arrival(timeout=15.0)
     finally:
         if ser and ser.is_open:
             send_serial("3")  # stop motor
