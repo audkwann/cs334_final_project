@@ -388,6 +388,7 @@ def spell_word(word: str, pause: float = LETTER_PAUSE):
     # Check for special words that are single segments
     if word == "YES":
         print("\n  Spelling: YES")
+        set_led_color(*LED_MOVING)
         goto_segment(char_to_segment("YES"))
         wait_for_arrival()
         set_led_color(*LED_AT_LETTER, breathe=False)
@@ -396,6 +397,7 @@ def spell_word(word: str, pause: float = LETTER_PAUSE):
 
     if word == "NO":
         print("\n  Spelling: NO")
+        set_led_color(*LED_MOVING)
         goto_segment(char_to_segment("NO"))
         wait_for_arrival()
         set_led_color(*LED_AT_LETTER, breathe=False)
@@ -404,6 +406,7 @@ def spell_word(word: str, pause: float = LETTER_PAUSE):
 
     if word == "GOODBYE":
         print("\n  Spelling: GOODBYE")
+        set_led_color(*LED_MOVING)
         goto_segment(char_to_segment("GOODBYE"))
         wait_for_arrival()
         set_led_color(*LED_AT_LETTER, breathe=False)
