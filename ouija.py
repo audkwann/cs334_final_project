@@ -31,7 +31,13 @@ try:
 except ModuleNotFoundError:
     _speech_available = False
     print("speech_recognition not installed - voice input disabled.")
-    print("Install with: pip install SpeechRecognition pyaudio")
+    print("Install with: pip install SpeechRecognition sounddevice")
+
+try:
+    import sounddevice as sd
+    _sounddevice_available = True
+except ModuleNotFoundError:
+    _sounddevice_available = False
 
 try:
     import requests
@@ -220,29 +226,47 @@ def listen_for_question() -> str | None:
         print("[speech] speech_recognition not available, falling back to text input")
         return input("Ask the spirits a question: ").strip() or None
 
+    if not _sounddevice_available:
+        print("[speech] sounddevice not installed - falling back to text input")
+        return input("Ask the spirits a question: ").strip() or None
+
     recognizer = sr.Recognizer()
     recognizer.energy_threshold = 300
     recognizer.dynamic_energy_threshold = True
 
     try:
-        with sr.Microphone() as source:
-            print("\n[listening] Speak your question to the spirits...")
-            recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            audio = recognizer.listen(source, timeout=8, phrase_time_limit=15)
+        sample_rate = 16000
+        channels = 1
+        duration_s = 15
+
+        print("\n[listening] Speak your question to the spirits...")
+        print(f"[listening] Recording up to {duration_s} seconds...")
+        recording = sd.rec(
+            int(duration_s * sample_rate),
+            samplerate=sample_rate,
+            channels=channels,
+            dtype="int16",
+            blocking=True,
+        )
+
+        audio_bytes = recording.tobytes()
+        audio = sr.AudioData(audio_bytes, sample_rate, sample_width=2)
 
         print("[processing] The spirits are listening...")
         text = recognizer.recognize_google(audio)
         print(f'[heard] "{text}"')
         return text.strip() if text.strip() else None
 
-    except sr.WaitTimeoutError:
-        print("[speech] No speech detected (timed out)")
-        return None
+    except KeyboardInterrupt:
+        raise
     except sr.UnknownValueError:
         print("[speech] Could not understand audio")
         return None
     except sr.RequestError as e:
         print(f"[speech] Recognition service error: {e}")
+        return None
+    except Exception as e:
+        print(f"[speech] Microphone error: {e}")
         return None
 
 
@@ -396,9 +420,11 @@ def ouija_session():
             time.sleep(1.0)
 
         except KeyboardInterrupt:
-            print("\n\n[session] Session interrupted...")
+            print("\n\n[session] Interrupted (Ctrl-C). Saying goodbye, then returning to segment 0...")
             spell_word("GOODBYE")
-            print("\nThe spirits depart. Farewell.")
+            goto_segment(0)
+            if ser and ser.is_open:
+                wait_for_position(0, timeout=15.0)
             session_active = False
 
 
@@ -446,6 +472,14 @@ if __name__ == "__main__":
 
     try:
         ouija_session()
+    except KeyboardInterrupt:
+        # In case Ctrl-C happens outside the session loop (e.g., during listen/spell),
+        # ensure we still say goodbye and return to home.
+        print("\n\nInterrupted (Ctrl-C). Saying goodbye, then returning to segment 0...")
+        spell_word("GOODBYE")
+        goto_segment(0)
+        if ser and ser.is_open:
+            wait_for_position(0, timeout=15.0)
     finally:
         if ser and ser.is_open:
             send_serial("3")  # stop motor
