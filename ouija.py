@@ -4,11 +4,13 @@ Ouija Board - A mystical spirit communication interface using a rotating table.
 
 The table spells out responses letter-by-letter as an ancient spirit answers questions.
 
-Layout (29 segments, ~12.41 degrees each):
+Layout (30 segments, 12 degrees each):
   Segment 0:  YES
   Segment 1:  GOODBYE
   Segment 2:  NO
-  Segments 3-28: A through Z
+  Segments 3-15: A through M
+  Segment 16: (blank/unused)
+  Segments 17-29: N through Z
 """
 
 import os
@@ -40,9 +42,10 @@ except ModuleNotFoundError:
 
 # --- Constants ---
 TICKS_PER_REV = 16567
-NUM_SEGMENTS = 29
-TICKS_PER_SEGMENT = TICKS_PER_REV // NUM_SEGMENTS  # ~571
+NUM_SEGMENTS = 30
+TICKS_PER_SEGMENT = TICKS_PER_REV // NUM_SEGMENTS  # ~552
 LETTER_PAUSE = 2.0  # seconds to pause at each letter
+BLANK_SEGMENT = 16  # unused slot opposite GOODBYE
 
 REACHY_API = "http://localhost:8000"
 
@@ -54,7 +57,14 @@ thinking_emotions = [
 # --- Segment Mapping ---
 
 def char_to_segment(char: str) -> int:
-    """Map a character or special word to its segment number (0-28)."""
+    """Map a character or special word to its segment number (0-29).
+
+    Layout (30 segments):
+      0: YES, 1: GOODBYE, 2: NO
+      3-15: A-M
+      16: (blank/unused)
+      17-29: N-Z
+    """
     char = char.upper()
     if char == "YES":
         return 0
@@ -62,8 +72,10 @@ def char_to_segment(char: str) -> int:
         return 1
     if char == "NO":
         return 2
-    if 'A' <= char <= 'Z':
-        return ord(char) - ord('A') + 3
+    if 'A' <= char <= 'M':
+        return ord(char) - ord('A') + 3  # A=3, M=15
+    if 'N' <= char <= 'Z':
+        return ord(char) - ord('A') + 4  # N=17, Z=29 (skip segment 16)
     return -1  # invalid character
 
 
@@ -75,8 +87,12 @@ def segment_to_label(segment: int) -> str:
         return "GOODBYE"
     if segment == 2:
         return "NO"
-    if 3 <= segment <= 28:
-        return chr(ord('A') + segment - 3)
+    if 3 <= segment <= 15:
+        return chr(ord('A') + segment - 3)  # A-M
+    if segment == 16:
+        return "(blank)"
+    if 17 <= segment <= 29:
+        return chr(ord('A') + segment - 4)  # N-Z
     return "?"
 
 
