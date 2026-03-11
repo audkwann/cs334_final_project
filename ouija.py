@@ -8,9 +8,8 @@ Layout (30 segments, 12 degrees each):
   Segment 0:  YES
   Segment 1:  GOODBYE
   Segment 2:  NO
-  Segments 3-15: A through M
-  Segment 16: (blank/unused)
-  Segments 17-29: N through Z
+  Segments 3-28: A through Z
+  Segment 29: (blank/unused)
 """
 
 import os
@@ -45,7 +44,7 @@ TICKS_PER_REV = 16567
 NUM_SEGMENTS = 30
 TICKS_PER_SEGMENT = TICKS_PER_REV // NUM_SEGMENTS  # ~552
 LETTER_PAUSE = 2.0  # seconds to pause at each letter
-BLANK_SEGMENT = 16  # unused slot opposite GOODBYE
+BLANK_SEGMENT = 29  # unused slot at the end
 
 REACHY_API = "http://localhost:8000"
 
@@ -61,9 +60,8 @@ def char_to_segment(char: str) -> int:
 
     Layout (30 segments):
       0: YES, 1: GOODBYE, 2: NO
-      3-15: A-M
-      16: (blank/unused)
-      17-29: N-Z
+      3-28: A-Z
+      29: (blank/unused)
     """
     char = char.upper()
     if char == "YES":
@@ -72,10 +70,8 @@ def char_to_segment(char: str) -> int:
         return 1
     if char == "NO":
         return 2
-    if 'A' <= char <= 'M':
-        return ord(char) - ord('A') + 3  # A=3, M=15
-    if 'N' <= char <= 'Z':
-        return ord(char) - ord('A') + 4  # N=17, Z=29 (skip segment 16)
+    if 'A' <= char <= 'Z':
+        return ord(char) - ord('A') + 3  # A=3, Z=28
     return -1  # invalid character
 
 
@@ -87,12 +83,10 @@ def segment_to_label(segment: int) -> str:
         return "GOODBYE"
     if segment == 2:
         return "NO"
-    if 3 <= segment <= 15:
-        return chr(ord('A') + segment - 3)  # A-M
-    if segment == 16:
+    if 3 <= segment <= 28:
+        return chr(ord('A') + segment - 3)  # A-Z
+    if segment == 29:
         return "(blank)"
-    if 17 <= segment <= 29:
-        return chr(ord('A') + segment - 4)  # N-Z
     return "?"
 
 
