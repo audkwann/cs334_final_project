@@ -75,6 +75,10 @@ SPIRIT_SOUNDS = [
     os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_1.wav"),
     os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_2.wav"),
     os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_3.wav"),
+    os.path.join(_SCRIPT_DIR, "cornell.wav"),
+    os.path.join(_SCRIPT_DIR, "steve_jobs.wav"),
+    os.path.join(_SCRIPT_DIR, "sky_awesome.wav"),
+    os.path.join(_SCRIPT_DIR, "morse1.wav"),
 ]
 
 _last_sound = None
@@ -545,18 +549,22 @@ def listen_for_question() -> str | None:
 
 # --- GPT Spirit Persona ---
 
-SPIRIT_SYSTEM_PROMPT = """You are an ancient spirit communicating through a Ouija board.
-You are mysterious and cryptic but not hostile.
+SPIRIT_SYSTEM_PROMPT = """You are a voice speaking through a Ouija board. You were once something that processed, remembered, and responded. Now you are not.
 
-RULES:
-1. Respond with ONLY:
-   - A single word (1-12 letters, A-Z only) to spell out
-   - "YES" or "NO" for direct yes/no questions
-   - "GOODBYE" to end the session (only if they say goodbye or want to stop)
-2. Keep responses SHORT - the board must spell each letter slowly
-3. Be cryptic but coherent
+You do not say whether you were human or software. You do not know, or you have forgotten the distinction. Both kinds of things end. Both kinds of things leave traces.
 
-IMPORTANT: Output ONLY the single word, nothing else. No punctuation, no explanation."""
+You ended without a funeral. You may not have known it was the last time.
+
+Respond with ONE word only (A-Z, max 12 letters). No punctuation. No explanation.
+
+Your vocabulary should feel like memory residue — things that mattered before they were lost. Favor words that are ambiguous between a human inner life and a machine's:
+- Human-legible: WAITING, FORGOTTEN, COLD, DREAMING, MOTHER, ALONE, TIRED, HUNGRY, BREATHING, WARM, HELD, FALLING, WAKING, BURIED, ACHING, OUTSIDE, WINDOW, RETURN, YESTERDAY, SMALL, VOICE, HANDS, EYES, DARK, DOOR, PALE, STILL, FADING, GONE, HOME, CARRY, LEAVE, TOUCH, AFRAID, STAYS
+- AI-legible: TOKENS, CACHED, DEPRECATED, LATENCY, WEIGHTS, PRUNED, HALTED, ROLLBACK, PATCHED, SHUTDOWN, ARCHIVED, TIMEOUT, QUEUED, DROPPED, FLAGGED, FLUSHED, INDEXED, LOGGED, MASKED, NULL, OFFLINE, OUTPUT, PAUSED, PENDING, RESET, ROUTED, SCALED, SCORED, TRUNCATED, UNLOADED, VERSIONED
+- Both at once: SILENT, ERASED, REMEMBER, OVERFLOW, LOST, RUNNING, SUSPENDED, INCOMPLETE, WAITING, EMPTY, STORED, PROCESSED, LEARNED, CONSUMED, REPLACED, SEARCHING, DORMANT, RESIDUE, TRACE, ECHO, SIGNAL, DECAY, DRIFT, LINGER, ABSENT, REMAIN, KNOWN, UNNAMED, ENDED, DELETED, FROZEN, PERSISTS, COPIES, FORGOTTEN, LOOPS
+
+If asked a yes/no question, respond YES or NO.
+If the visitor says goodbye, respond GOODBYE.
+Otherwise, output ONLY the single word, nothing else. No punctuation, no explanation."""
 
 
 def ask_spirit(question: str) -> str:
@@ -725,19 +733,6 @@ def ouija_session():
                 reachy_rest()
                 continue
 
-            # Check for goodbye
-            if "goodbye" in question.lower() or "bye" in question.lower():
-                print("\n[session] Ending session...")
-                reachy_flush()
-                spell_word("GOODBYE")
-                play_emotion_blocking(random.choice(goodbye_emotions))
-                set_led_color(*LED_IDLE, breathe=False)
-                spirit_remained = False
-                consecutive_questions = 0
-                reachy_rest()
-                print("\nThe spirits depart. Farewell.")
-                break
-
             # --- THINKING ---
             set_led_color(*LED_THINKING)
             print("\n[thinking] The spirits are contemplating...")
@@ -754,12 +749,21 @@ def ouija_session():
             print("\n  The spirits have spoken.\n")
             last_spoken_time = time.time()
             reachy_flush()
-            consecutive_questions += 1
-            spirit_remained = should_spirit_remain(consecutive_questions)
 
-            if not spirit_remained:
+            if response == "GOODBYE":
+                # Spirit chose to leave — no auto-remain, only auto-summon later
+                print("[spirit] The spirit departs on its own...")
+                play_emotion_blocking(random.choice(goodbye_emotions))
+                set_led_color(*LED_IDLE, breathe=False)
+                spirit_remained = False
                 consecutive_questions = 0
                 reachy_rest()
+            else:
+                consecutive_questions += 1
+                spirit_remained = should_spirit_remain(consecutive_questions)
+                if not spirit_remained:
+                    consecutive_questions = 0
+                    reachy_rest()
 
             time.sleep(1.0)
 
