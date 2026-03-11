@@ -40,6 +40,12 @@ except ModuleNotFoundError:
     _sounddevice_available = False
 
 try:
+    import soundfile as sf
+    _soundfile_available = True
+except ModuleNotFoundError:
+    _soundfile_available = False
+
+try:
     import requests
     _requests_available = True
 except ModuleNotFoundError:
@@ -60,6 +66,77 @@ LED_MOVING = (255, 40, 0)       # red/orange, breathing
 LED_AT_LETTER = (255, 255, 255)  # white, solid (no breathing)
 
 REACHY_API = "http://localhost:8000"
+
+# --- Sound ---
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+SPIRIT_SOUNDS = [
+    os.path.join(_SCRIPT_DIR, "Ghostly_Pad.wav"),
+    os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_1.wav"),
+    os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_2.wav"),
+    os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_3.wav"),
+]
+
+_last_sound = None
+_sound_stream = None
+
+
+def play_sound(path: str):
+    """Play a stereo WAV file on a dedicated output stream (won't be killed by sd.rec)."""
+    global _sound_stream
+    if not (_sounddevice_available and _soundfile_available):
+        print(f"[sound] cannot play {os.path.basename(path)} (missing sounddevice/soundfile)")
+        return
+    try:
+        data, samplerate = sf.read(path, dtype="float32")
+        # Stop any previous sound
+        if _sound_stream is not None:
+            _sound_stream.stop()
+            _sound_stream.close()
+            _sound_stream = None
+
+        # Use a dedicated OutputStream so sd.rec() doesn't interrupt playback
+        _sound_stream = sd.OutputStream(
+            samplerate=samplerate,
+            channels=data.shape[1] if data.ndim > 1 else 1,
+            dtype="float32",
+        )
+        _pos = [0]
+
+        def _callback(outdata, frames, time_info, status):
+            end = _pos[0] + frames
+            chunk = data[_pos[0]:end]
+            if len(chunk) < frames:
+                outdata[:len(chunk)] = chunk
+                outdata[len(chunk):] = 0
+                _pos[0] = len(data)
+                raise sd.CallbackStop
+            else:
+                outdata[:] = chunk
+                _pos[0] = end
+
+        _sound_stream = sd.OutputStream(
+            samplerate=samplerate,
+            channels=data.shape[1] if data.ndim > 1 else 1,
+            dtype="float32",
+            callback=_callback,
+        )
+        _sound_stream.start()
+        print(f"[sound] playing {os.path.basename(path)}")
+    except Exception as e:
+        print(f"[sound] error: {e}")
+
+
+def play_random_spirit_sound():
+    """Pick a random spirit sound, avoiding the previous one."""
+    global _last_sound
+    choices = [s for s in SPIRIT_SOUNDS if s != _last_sound]
+    if not choices:
+        choices = SPIRIT_SOUNDS
+    pick = random.choice(choices)
+    _last_sound = pick
+    play_sound(pick)
+
 
 thinking_emotions = [
     "thoughtful1", "thoughtful2", "curious1", "inquiring1", "inquiring2",
@@ -451,6 +528,7 @@ def ouija_session():
 
             # --- SPIRIT: breathing red, listening ---
             set_led_color(*LED_SPIRIT)
+            play_random_spirit_sound()
             question = listen_for_question()
             if not question:
                 print("The spirits did not hear you. Try again.")
