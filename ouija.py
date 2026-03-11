@@ -362,11 +362,15 @@ if arduino_port:
                                 reached_pos = int(msg[8:])
                             except ValueError:
                                 reached_pos = None
-                            # Only accept REACHED if close to our target (within 1 segment)
-                            if _goto_target is not None and reached_pos is not None:
-                                if abs(reached_pos - _goto_target) > TICKS_PER_SEGMENT:
-                                    print(f"  [motor] IGNORING spurious {msg} (target={_goto_target})")
-                                    continue
+                            # No active goto — ignore stray REACHED
+                            if _goto_target is None:
+                                print(f"  [motor] IGNORING stray {msg} (no active goto)")
+                                continue
+                            # Wrong position — ignore and re-send goto
+                            if reached_pos is not None and abs(reached_pos - _goto_target) > TICKS_PER_SEGMENT:
+                                print(f"  [motor] IGNORING spurious {msg} (target={_goto_target}), resending")
+                                send_serial(f"g{_goto_target}")
+                                continue
                             _reached_event.set()
                             print(f"  [motor] {msg}")
                         elif msg.startswith("ZEROED"):
@@ -630,6 +634,17 @@ def spell_word(word: str, pause: float = LETTER_PAUSE):
             time.sleep(pause)
 
 
+# --- Spirit Persistence ---
+
+def should_spirit_remain(consecutive: int) -> bool:
+    """Decide whether the spirit remains for another question.
+
+    Phase 1: always remain (100% chance).
+    Future: 100% for questions 1-2, 75% for 3+.
+    """
+    return True
+
+
 # --- Main Session ---
 
 def ouija_session():
@@ -644,20 +659,25 @@ def ouija_session():
     print()
 
     session_active = True
+    spirit_remained = False
+    consecutive_questions = 0
 
     # Start in rest position
     reachy_rest()
 
     while session_active:
         try:
-            # --- IDLE: solid red, waiting for 's' ---
-            set_led_color(*LED_IDLE, breathe=False)
-            print("[idle] Press 's' to summon the spirits...")
-            wait_for_key('s')
+            if not spirit_remained:
+                # --- IDLE: solid red, waiting for 's' ---
+                set_led_color(*LED_IDLE, breathe=False)
+                print("[idle] Press 's' to summon the spirits...")
+                wait_for_key('s')
 
-            # --- SUMMONED: wake up (blocking), then start face tracking ---
-            print("[summoned] The spirits stir...")
-            play_emotion_blocking(random.choice(awakening_emotions), duration=3.0)
+                # --- SUMMONED ---
+                print("[summoned] The spirits stir...")
+                play_emotion_blocking(random.choice(awakening_emotions), duration=3.0)
+            else:
+                print("[spirit] The spirit remains...")
 
             # --- SPIRIT: breathing red, listening ---
             set_led_color(*LED_SPIRIT)
@@ -666,6 +686,8 @@ def ouija_session():
             question = listen_for_question()
             if not question:
                 print("The spirits did not hear you. Try again.")
+                spirit_remained = False
+                consecutive_questions = 0
                 reachy_rest()
                 continue
 
@@ -676,6 +698,8 @@ def ouija_session():
                 spell_word("GOODBYE")
                 play_emotion_blocking(random.choice(goodbye_emotions))
                 set_led_color(*LED_IDLE, breathe=False)
+                spirit_remained = False
+                consecutive_questions = 0
                 reachy_rest()
                 print("\nThe spirits depart. Farewell.")
                 break
@@ -692,10 +716,16 @@ def ouija_session():
             # --- MOVING / AT_LETTER handled inside spell_word ---
             spell_word(response)
 
-            # Brief pause before returning to idle
+            # --- Decide whether the spirit remains ---
             print("\n  The spirits have spoken.\n")
             reachy_flush()
-            reachy_rest()
+            consecutive_questions += 1
+            spirit_remained = should_spirit_remain(consecutive_questions)
+
+            if not spirit_remained:
+                consecutive_questions = 0
+                reachy_rest()
+
             time.sleep(1.0)
 
         except KeyboardInterrupt:
