@@ -453,6 +453,62 @@ def wait_for_arrival(timeout: float = 15.0) -> bool:
     return _reached_event.wait(timeout=timeout)
 
 
+# --- Idle Twitching ---
+
+TWITCH_TICKS = 150  # ~1/4 segment, small jolt
+
+_twitch_active = threading.Event()
+_twitch_thread = None
+
+
+def _idle_twitch_loop():
+    """Background thread: periodically twitch the table while idle."""
+    while _twitch_active.is_set():
+        # Sleep 20-30s in 0.5s increments so we can exit promptly
+        delay = random.uniform(20.0, 30.0)
+        elapsed = 0.0
+        while elapsed < delay:
+            if not _twitch_active.is_set():
+                return
+            time.sleep(0.5)
+            elapsed += 0.5
+
+        if not _twitch_active.is_set():
+            return
+
+        # Twitch: small movement in random direction
+        origin = get_position()
+        direction = random.choice([-1, 1])
+        offset = direction * TWITCH_TICKS
+        print(f"  [twitch] {origin} -> {origin + offset}")
+        goto_ticks(origin + offset)
+        wait_for_arrival(timeout=3.0)
+
+        if not _twitch_active.is_set():
+            return
+
+        # Return to origin after ~1s
+        time.sleep(1.0)
+        if not _twitch_active.is_set():
+            return
+        print(f"  [twitch] {origin + offset} -> {origin}")
+        goto_ticks(origin)
+        wait_for_arrival(timeout=3.0)
+
+
+def start_idle_twitch():
+    """Start the idle twitching background thread."""
+    global _twitch_thread
+    _twitch_active.set()
+    _twitch_thread = threading.Thread(target=_idle_twitch_loop, daemon=True)
+    _twitch_thread.start()
+
+
+def stop_idle_twitch():
+    """Stop the idle twitching background thread."""
+    _twitch_active.clear()
+
+
 # --- Keyboard Input ---
 
 def wait_for_key(key: str):
@@ -703,11 +759,13 @@ def ouija_session():
             if not spirit_remained:
                 # --- IDLE: solid red, waiting for 's' or auto-summon ---
                 set_led_color(*LED_IDLE, breathe=False)
+                start_idle_twitch()
                 if last_spoken_time is not None:
                     auto_delay = random.uniform(40.0, 120.0)
                     remaining = max(0, auto_delay - (time.time() - last_spoken_time))
                     print(f"[idle] Press 's' to summon the spirits (auto-summon in {remaining:.0f}s)...")
                     key_pressed = wait_for_key_or_timeout('s', remaining)
+                    stop_idle_twitch()
                     if key_pressed:
                         print("[summoned] The spirits stir...")
                     else:
@@ -715,6 +773,7 @@ def ouija_session():
                 else:
                     print("[idle] Press 's' to summon the spirits...")
                     wait_for_key('s')
+                    stop_idle_twitch()
                     print("[summoned] The spirits stir...")
 
                 play_emotion_blocking(random.choice(awakening_emotions), duration=3.0)
@@ -769,6 +828,7 @@ def ouija_session():
 
         except KeyboardInterrupt:
             print("\n\n[session] Interrupted (Ctrl-C). Saying goodbye, then returning to segment 0...")
+            stop_idle_twitch()
             reachy_flush()
             spell_word("GOODBYE")
             play_emotion_blocking(random.choice(goodbye_emotions))
