@@ -51,13 +51,6 @@ try:
 except ModuleNotFoundError:
     _requests_available = False
 
-try:
-    import cv2
-    _cv2_available = True
-except ModuleNotFoundError:
-    _cv2_available = False
-    print("OpenCV not installed - face tracking disabled.")
-
 # --- Constants ---
 TICKS_PER_REV = 16567
 NUM_SEGMENTS = 30
@@ -145,26 +138,10 @@ def play_random_spirit_sound():
     play_sound(pick)
 
 
-# --- Emotion Pools ---
-
 thinking_emotions = [
     "thoughtful1", "thoughtful2", "curious1", "inquiring1", "inquiring2",
     "uncertain1", "confused1", "attentive1", "attentive2"
 ]
-
-awakening_emotions = ["welcoming1", "curious1", "shy1", "surprised1"]
-
-spirit_emotions = ["scared1", "fear1", "anxiety1", "uncertain1", "electric1"]
-
-moving_emotions = ["uncertain1", "uncomfortable1", "anxiety1", "confused1"]
-
-at_letter_emotions = ["surprised1", "surprised2", "attentive1", "attentive2"]
-
-yes_emotions = ["yes1", "cheerful1", "enthusiastic1"]
-
-no_emotions = ["no1", "displeased1", "contempt1"]
-
-goodbye_emotions = ["sad1", "sad2", "lonely1", "downcast1", "dying1"]
 
 # --- Segment Mapping ---
 
@@ -221,7 +198,6 @@ reachy_available = check_api_health()
 
 
 def play_emotion(emotion_name: str):
-    """Raw emotion call. Fire-and-forget HTTP POST, returns in ~200ms."""
     if not reachy_available or not _requests_available:
         return
     dataset_name = "pollen-robotics%2Freachy-mini-emotions-library"
@@ -231,156 +207,6 @@ def play_emotion(emotion_name: str):
         response.raise_for_status()
     except Exception:
         pass
-
-
-def _reachy_goto_raw(body_yaw_rad=None, head_yaw_rad=None, head_pitch_rad=None,
-                     duration=2.0, interpolation="minjerk"):
-    """Raw goto call. Sends POST to Reachy goto API."""
-    if not reachy_available or not _requests_available:
-        return
-    payload = {"duration": duration, "interpolation": interpolation}
-    if body_yaw_rad is not None:
-        payload["body_yaw"] = body_yaw_rad
-    if head_yaw_rad is not None or head_pitch_rad is not None:
-        payload["head_pose"] = {
-            "x": 0, "y": 0, "z": 0, "roll": 0,
-            "pitch": head_pitch_rad if head_pitch_rad is not None else 0.0,
-            "yaw": head_yaw_rad if head_yaw_rad is not None else 0.0,
-        }
-    try:
-        requests.post(f"{REACHY_API}/api/move/goto", json=payload, timeout=10)
-    except Exception as e:
-        print(f"  [reachy] goto error: {e}")
-
-
-# --- Reachy Action Serialization ---
-
-_reachy_lock = threading.Lock()
-_reachy_busy_until = 0.0  # timestamp when current Reachy action finishes
-
-EMOTION_DURATION = 6.0  # estimated seconds for emotion animations
-
-
-def _wait_for_reachy():
-    """Block until the estimated end of the current Reachy action."""
-    remaining = _reachy_busy_until - time.time()
-    if remaining > 0:
-        time.sleep(remaining)
-
-
-def play_emotion_blocking(emotion_name, duration=EMOTION_DURATION):
-    """Play emotion and block until estimated completion."""
-    global _reachy_busy_until
-    with _reachy_lock:
-        _wait_for_reachy()
-        play_emotion(emotion_name)
-        _reachy_busy_until = time.time() + duration
-
-
-def play_emotion_async(emotion_name, duration=EMOTION_DURATION):
-    """Fire emotion in background thread. Non-blocking to caller."""
-    threading.Thread(
-        target=play_emotion_blocking,
-        args=(emotion_name, duration),
-        daemon=True
-    ).start()
-
-
-def reachy_goto_blocking(body_yaw_rad=None, head_yaw_rad=None, head_pitch_rad=None,
-                         duration=2.0, interpolation="minjerk"):
-    """Move Reachy via goto API, respecting the action lock."""
-    global _reachy_busy_until
-    with _reachy_lock:
-        _wait_for_reachy()
-        _reachy_goto_raw(body_yaw_rad=body_yaw_rad, head_yaw_rad=head_yaw_rad,
-                         head_pitch_rad=head_pitch_rad, duration=duration,
-                         interpolation=interpolation)
-        _reachy_busy_until = time.time() + duration
-
-
-def reachy_rest():
-    """Send Reachy to rest pose: head slightly down, body centered."""
-    reachy_goto_blocking(body_yaw_rad=0.0, head_yaw_rad=0.0, head_pitch_rad=-0.2, duration=2.0)
-
-
-# --- Face Tracking ---
-
-_face_track_active = threading.Event()
-_face_track_thread = None
-
-
-def _face_tracking_loop():
-    """Background thread: detect faces via Haar cascade, map to Reachy head/body yaw."""
-    global _reachy_busy_until
-    if not _cv2_available:
-        print("[face-track] OpenCV not available, skipping face tracking")
-        return
-
-    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[face-track] Camera not available, Reachy will stay forward")
-        return
-
-    print("[face-track] Face tracking started")
-    try:
-        while _face_track_active.is_set():
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.1)
-                continue
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5, minSize=(60, 60))
-
-            if len(faces) > 0:
-                # Use the largest face
-                faces_sorted = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-                x, y, w, h = faces_sorted[0]
-                frame_w = frame.shape[1]
-                frame_h = frame.shape[0]
-
-                # Map face center x to body yaw: center=0, left=+0.5rad, right=-0.5rad
-                face_cx = (x + w / 2) / frame_w  # 0..1
-                body_yaw = (0.5 - face_cx) * 1.0  # roughly -0.5 to +0.5 rad
-
-                # Map face center y to head pitch: center=0, up=+0.3, down=-0.3
-                face_cy = (y + h / 2) / frame_h
-                head_pitch = (0.5 - face_cy) * 0.6  # roughly -0.3 to +0.3 rad
-
-                # Try to acquire lock non-blocking; skip frame if emotion is playing
-                if _reachy_lock.acquire(blocking=False):
-                    try:
-                        remaining = _reachy_busy_until - time.time()
-                        if remaining <= 0:
-                            _reachy_goto_raw(body_yaw_rad=body_yaw,
-                                             head_yaw_rad=body_yaw * 0.5,
-                                             head_pitch_rad=head_pitch,
-                                             duration=0.25,
-                                             interpolation="minjerk")
-                            _reachy_busy_until = time.time() + 0.3
-                    finally:
-                        _reachy_lock.release()
-
-            time.sleep(0.3)  # ~3 updates/sec
-    finally:
-        cap.release()
-        print("[face-track] Face tracking stopped")
-
-
-def start_face_tracking():
-    """Start face tracking in a background thread."""
-    global _face_track_thread
-    if not reachy_available or not _cv2_available:
-        return
-    _face_track_active.set()
-    _face_track_thread = threading.Thread(target=_face_tracking_loop, daemon=True)
-    _face_track_thread.start()
-
-
-def stop_face_tracking():
-    """Stop the face tracking background thread."""
-    _face_track_active.clear()
 
 
 # --- Serial / Arduino Setup ---
@@ -401,7 +227,6 @@ ser = None
 
 _encoder_position = 0
 _encoder_lock = threading.Lock()
-_serial_lock = threading.Lock()
 _serial_stop = threading.Event()
 _reached_event = threading.Event()
 
@@ -445,9 +270,8 @@ else:
 
 def send_serial(cmd: str):
     if ser and ser.is_open:
-        with _serial_lock:
-            ser.write(f"{cmd}\n".encode("ascii"))
-            ser.flush()
+        ser.write(f"{cmd}\n".encode("ascii"))
+        ser.flush()
 
 
 def set_led_color(r: int, g: int, b: int, breathe: bool = True):
@@ -630,11 +454,7 @@ def ask_spirit(question: str) -> str:
 # --- Spelling ---
 
 def spell_word(word: str, pause: float = LETTER_PAUSE):
-    """Spell out a word by moving to each letter's segment.
-
-    All emotion calls are async (non-blocking) so serial timing stays
-    identical to v1.
-    """
+    """Spell out a word by moving to each letter's segment."""
     word = word.upper().strip()
     # Clean: only keep valid characters
     word = ''.join(c for c in word if 'A' <= c <= 'Z')
@@ -646,7 +466,6 @@ def spell_word(word: str, pause: float = LETTER_PAUSE):
     if word == "YES":
         print("\n  Spelling: YES")
         set_led_color(*LED_MOVING)
-        play_emotion_async(random.choice(yes_emotions))
         goto_segment(char_to_segment("YES"))
         wait_for_arrival()
         set_led_color(*LED_AT_LETTER, breathe=False)
@@ -656,7 +475,6 @@ def spell_word(word: str, pause: float = LETTER_PAUSE):
     if word == "NO":
         print("\n  Spelling: NO")
         set_led_color(*LED_MOVING)
-        play_emotion_async(random.choice(no_emotions))
         goto_segment(char_to_segment("NO"))
         wait_for_arrival()
         set_led_color(*LED_AT_LETTER, breathe=False)
@@ -666,7 +484,6 @@ def spell_word(word: str, pause: float = LETTER_PAUSE):
     if word == "GOODBYE":
         print("\n  Spelling: GOODBYE")
         set_led_color(*LED_MOVING)
-        play_emotion_async(random.choice(goodbye_emotions))
         goto_segment(char_to_segment("GOODBYE"))
         wait_for_arrival()
         set_led_color(*LED_AT_LETTER, breathe=False)
@@ -680,11 +497,9 @@ def spell_word(word: str, pause: float = LETTER_PAUSE):
         if seg >= 0:
             print(f"  [{i+1}/{len(word)}] {char}", end="", flush=True)
             set_led_color(*LED_MOVING)
-            play_emotion_async(random.choice(moving_emotions))
             goto_segment(seg)
             wait_for_arrival()
             set_led_color(*LED_AT_LETTER, breathe=False)
-            play_emotion_async(random.choice(at_letter_emotions))
             print(" ... done")
             time.sleep(pause)
 
@@ -704,9 +519,6 @@ def ouija_session():
 
     session_active = True
 
-    # Start in rest position
-    reachy_rest()
-
     while session_active:
         try:
             # --- IDLE: solid red, waiting for 's' ---
@@ -714,38 +526,26 @@ def ouija_session():
             print("[idle] Press 's' to summon the spirits...")
             wait_for_key('s')
 
-            # --- SUMMONED: wake up (blocking), then start face tracking ---
-            print("[summoned] The spirits stir...")
-            play_emotion_blocking(random.choice(awakening_emotions), duration=3.0)
-            start_face_tracking()
-
             # --- SPIRIT: breathing red, listening ---
             set_led_color(*LED_SPIRIT)
             play_random_spirit_sound()
-            play_emotion_async(random.choice(spirit_emotions))
             question = listen_for_question()
             if not question:
                 print("The spirits did not hear you. Try again.")
-                stop_face_tracking()
-                reachy_rest()
                 continue
 
             # Check for goodbye
             if "goodbye" in question.lower() or "bye" in question.lower():
                 print("\n[session] Ending session...")
-                stop_face_tracking()
                 spell_word("GOODBYE")
-                play_emotion_blocking(random.choice(goodbye_emotions))
                 set_led_color(*LED_IDLE, breathe=False)
-                reachy_rest()
                 print("\nThe spirits depart. Farewell.")
                 break
 
-            # --- THINKING: stop face tracking, think ---
-            stop_face_tracking()
+            # --- THINKING: breathing red ---
             set_led_color(*LED_THINKING)
             print("\n[thinking] The spirits are contemplating...")
-            play_emotion_blocking(random.choice(thinking_emotions))
+            play_emotion(random.choice(thinking_emotions))
             time.sleep(1.5)
 
             # Ask the spirit
@@ -756,16 +556,12 @@ def ouija_session():
 
             # Brief pause before returning to idle
             print("\n  The spirits have spoken.\n")
-            reachy_rest()
             time.sleep(1.0)
 
         except KeyboardInterrupt:
             print("\n\n[session] Interrupted (Ctrl-C). Saying goodbye, then returning to segment 0...")
-            stop_face_tracking()
             spell_word("GOODBYE")
-            play_emotion_blocking(random.choice(goodbye_emotions))
             set_led_color(*LED_IDLE, breathe=False)
-            reachy_rest()
             goto_segment(0)
             if ser and ser.is_open:
                 wait_for_arrival(timeout=15.0)
@@ -817,11 +613,10 @@ if __name__ == "__main__":
     try:
         ouija_session()
     except KeyboardInterrupt:
+        # In case Ctrl-C happens outside the session loop (e.g., during listen/spell),
+        # ensure we still say goodbye and return to home.
         print("\n\nInterrupted (Ctrl-C). Saying goodbye, then returning to segment 0...")
-        stop_face_tracking()
         spell_word("GOODBYE")
-        play_emotion_blocking(random.choice(goodbye_emotions))
-        reachy_rest()
         goto_segment(0)
         if ser and ser.is_open:
             wait_for_arrival(timeout=15.0)
