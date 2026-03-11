@@ -51,13 +51,6 @@ try:
 except ModuleNotFoundError:
     _requests_available = False
 
-try:
-    import cv2
-    _cv2_available = True
-except ModuleNotFoundError:
-    _cv2_available = False
-    print("OpenCV not installed - face tracking disabled.")
-
 # --- Constants ---
 TICKS_PER_REV = 16567
 NUM_SEGMENTS = 30
@@ -258,7 +251,7 @@ def _reachy_goto_raw(body_yaw_rad=None, head_yaw_rad=None, head_pitch_rad=None,
 _reachy_lock = threading.Lock()
 _reachy_busy_until = 0.0  # timestamp when current Reachy action finishes
 
-EMOTION_DURATION = 6.0  # estimated seconds for emotion animations
+EMOTION_DURATION = 2.0  # estimated seconds for emotion animations
 
 
 def _wait_for_reachy():
@@ -286,6 +279,13 @@ def play_emotion_async(emotion_name, duration=EMOTION_DURATION):
     ).start()
 
 
+def reachy_flush():
+    """Reset the emotion timer so queued async emotions drain immediately."""
+    global _reachy_busy_until
+    with _reachy_lock:
+        _reachy_busy_until = 0.0
+
+
 def reachy_goto_blocking(body_yaw_rad=None, head_yaw_rad=None, head_pitch_rad=None,
                          duration=2.0, interpolation="minjerk"):
     """Move Reachy via goto API, respecting the action lock."""
@@ -303,92 +303,21 @@ def reachy_rest():
     reachy_goto_blocking(body_yaw_rad=0.0, head_yaw_rad=0.0, head_pitch_rad=-0.2, duration=2.0)
 
 
-# --- Face Tracking ---
-
-_face_track_active = threading.Event()
-_face_track_thread = None
-
-
-def _face_tracking_loop():
-    """Background thread: detect faces via Haar cascade, map to Reachy head/body yaw."""
-    global _reachy_busy_until
-    if not _cv2_available:
-        print("[face-track] OpenCV not available, skipping face tracking")
-        return
-
-    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[face-track] Camera not available, Reachy will stay forward")
-        return
-
-    print("[face-track] Face tracking started")
-    try:
-        while _face_track_active.is_set():
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.1)
-                continue
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5, minSize=(60, 60))
-
-            if len(faces) > 0:
-                # Use the largest face
-                faces_sorted = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-                x, y, w, h = faces_sorted[0]
-                frame_w = frame.shape[1]
-                frame_h = frame.shape[0]
-
-                # Map face center x to body yaw: center=0, left=+0.5rad, right=-0.5rad
-                face_cx = (x + w / 2) / frame_w  # 0..1
-                body_yaw = (0.5 - face_cx) * 1.0  # roughly -0.5 to +0.5 rad
-
-                # Map face center y to head pitch: center=0, up=+0.3, down=-0.3
-                face_cy = (y + h / 2) / frame_h
-                head_pitch = (0.5 - face_cy) * 0.6  # roughly -0.3 to +0.3 rad
-
-                # Try to acquire lock non-blocking; skip frame if emotion is playing
-                if _reachy_lock.acquire(blocking=False):
-                    try:
-                        remaining = _reachy_busy_until - time.time()
-                        if remaining <= 0:
-                            _reachy_goto_raw(body_yaw_rad=body_yaw,
-                                             head_yaw_rad=body_yaw * 0.5,
-                                             head_pitch_rad=head_pitch,
-                                             duration=0.25,
-                                             interpolation="minjerk")
-                            _reachy_busy_until = time.time() + 0.3
-                    finally:
-                        _reachy_lock.release()
-
-            time.sleep(0.3)  # ~3 updates/sec
-    finally:
-        cap.release()
-        print("[face-track] Face tracking stopped")
-
-
-def start_face_tracking():
-    """Start face tracking in a background thread."""
-    global _face_track_thread
-    if not reachy_available or not _cv2_available:
-        return
-    _face_track_active.set()
-    _face_track_thread = threading.Thread(target=_face_tracking_loop, daemon=True)
-    _face_track_thread.start()
-
-
-def stop_face_tracking():
-    """Stop the face tracking background thread."""
-    _face_track_active.clear()
-
-
 # --- Serial / Arduino Setup ---
 
 def find_arduino_port():
     ports = sorted(list_ports.comports(), key=lambda p: p.device)
+    # First pass: prefer ports with "arduino" in description (most specific)
     for p in ports:
-        if p.device.startswith(("/dev/tty.usb", "/dev/cu.usb")) or "arduino" in (p.description or "").lower():
+        if "arduino" in (p.description or "").lower():
+            return p.device
+    # Second pass: match USB serial ports, but skip the Reachy Mini
+    for p in ports:
+        if p.device.startswith(("/dev/tty.usb", "/dev/cu.usb")):
+            # Skip known Reachy Mini port pattern (long hex serial number)
+            basename = p.device.rsplit("/", 1)[-1]
+            if len(basename) > len("usbmodem") + 10:
+                continue
             return p.device
     print("No Arduino found. Available ports:")
     for p in ports:
@@ -400,6 +329,7 @@ arduino_port = find_arduino_port()
 ser = None
 
 _encoder_position = 0
+_goto_target = None  # target ticks for current goto command
 _encoder_lock = threading.Lock()
 _serial_lock = threading.Lock()
 _serial_stop = threading.Event()
@@ -428,6 +358,15 @@ if arduino_port:
                             except ValueError:
                                 pass
                         elif msg.startswith("REACHED "):
+                            try:
+                                reached_pos = int(msg[8:])
+                            except ValueError:
+                                reached_pos = None
+                            # Only accept REACHED if close to our target (within 1 segment)
+                            if _goto_target is not None and reached_pos is not None:
+                                if abs(reached_pos - _goto_target) > TICKS_PER_SEGMENT:
+                                    print(f"  [motor] IGNORING spurious {msg} (target={_goto_target})")
+                                    continue
                             _reached_event.set()
                             print(f"  [motor] {msg}")
                         elif msg.startswith("ZEROED"):
@@ -462,6 +401,8 @@ def get_position() -> int:
 
 
 def goto_ticks(ticks: int):
+    global _goto_target
+    _goto_target = ticks
     _reached_event.clear()
     send_serial(f"g{ticks}")
 
@@ -717,7 +658,6 @@ def ouija_session():
             # --- SUMMONED: wake up (blocking), then start face tracking ---
             print("[summoned] The spirits stir...")
             play_emotion_blocking(random.choice(awakening_emotions), duration=3.0)
-            start_face_tracking()
 
             # --- SPIRIT: breathing red, listening ---
             set_led_color(*LED_SPIRIT)
@@ -726,14 +666,13 @@ def ouija_session():
             question = listen_for_question()
             if not question:
                 print("The spirits did not hear you. Try again.")
-                stop_face_tracking()
                 reachy_rest()
                 continue
 
             # Check for goodbye
             if "goodbye" in question.lower() or "bye" in question.lower():
                 print("\n[session] Ending session...")
-                stop_face_tracking()
+                reachy_flush()
                 spell_word("GOODBYE")
                 play_emotion_blocking(random.choice(goodbye_emotions))
                 set_led_color(*LED_IDLE, breathe=False)
@@ -741,8 +680,7 @@ def ouija_session():
                 print("\nThe spirits depart. Farewell.")
                 break
 
-            # --- THINKING: stop face tracking, think ---
-            stop_face_tracking()
+            # --- THINKING ---
             set_led_color(*LED_THINKING)
             print("\n[thinking] The spirits are contemplating...")
             play_emotion_blocking(random.choice(thinking_emotions))
@@ -756,12 +694,13 @@ def ouija_session():
 
             # Brief pause before returning to idle
             print("\n  The spirits have spoken.\n")
+            reachy_flush()
             reachy_rest()
             time.sleep(1.0)
 
         except KeyboardInterrupt:
             print("\n\n[session] Interrupted (Ctrl-C). Saying goodbye, then returning to segment 0...")
-            stop_face_tracking()
+            reachy_flush()
             spell_word("GOODBYE")
             play_emotion_blocking(random.choice(goodbye_emotions))
             set_led_color(*LED_IDLE, breathe=False)
@@ -818,7 +757,7 @@ if __name__ == "__main__":
         ouija_session()
     except KeyboardInterrupt:
         print("\n\nInterrupted (Ctrl-C). Saying goodbye, then returning to segment 0...")
-        stop_face_tracking()
+        reachy_flush()
         spell_word("GOODBYE")
         play_emotion_blocking(random.choice(goodbye_emotions))
         reachy_rest()
