@@ -468,6 +468,29 @@ def wait_for_key(key: str):
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
+def wait_for_key_or_timeout(key: str, timeout: float) -> bool:
+    """Wait for a keypress or timeout. Returns True if key was pressed, False on timeout."""
+    import tty, termios, select
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            ready, _, _ = select.select([fd], [], [], min(remaining, 0.5))
+            if ready:
+                ch = sys.stdin.read(1)
+                if ch == key:
+                    return True
+                if ch == '\x03':
+                    raise KeyboardInterrupt
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
 # --- Speech Recognition ---
 
 def listen_for_question() -> str | None:
@@ -532,7 +555,6 @@ RULES:
    - "GOODBYE" to end the session (only if they say goodbye or want to stop)
 2. Keep responses SHORT - the board must spell each letter slowly
 3. Be cryptic but coherent
-4. Favor mystical words like: SOON, BEWARE, FATE, NEVER, SEEK, WAIT, DREAM, TRUTH, SHADOW, BEYOND, SPIRIT, ETERNAL
 
 IMPORTANT: Output ONLY the single word, nothing else. No punctuation, no explanation."""
 
@@ -644,7 +666,7 @@ def should_spirit_remain(consecutive: int) -> bool:
     """
     if consecutive < 2:
         return True
-    return random.random() < 0.75
+    return random.random() < 0.60
 
 
 # --- Main Session ---
@@ -663,6 +685,7 @@ def ouija_session():
     session_active = True
     spirit_remained = False
     consecutive_questions = 0
+    last_spoken_time = None  # timestamp of last "spirits have spoken"
 
     # Start in rest position
     reachy_rest()
@@ -670,13 +693,22 @@ def ouija_session():
     while session_active:
         try:
             if not spirit_remained:
-                # --- IDLE: solid red, waiting for 's' ---
+                # --- IDLE: solid red, waiting for 's' or auto-summon ---
                 set_led_color(*LED_IDLE, breathe=False)
-                print("[idle] Press 's' to summon the spirits...")
-                wait_for_key('s')
+                if last_spoken_time is not None:
+                    auto_delay = random.uniform(40.0, 120.0)
+                    remaining = max(0, auto_delay - (time.time() - last_spoken_time))
+                    print(f"[idle] Press 's' to summon the spirits (auto-summon in {remaining:.0f}s)...")
+                    key_pressed = wait_for_key_or_timeout('s', remaining)
+                    if key_pressed:
+                        print("[summoned] The spirits stir...")
+                    else:
+                        print("[auto-summon] The spirits return unbidden...")
+                else:
+                    print("[idle] Press 's' to summon the spirits...")
+                    wait_for_key('s')
+                    print("[summoned] The spirits stir...")
 
-                # --- SUMMONED ---
-                print("[summoned] The spirits stir...")
                 play_emotion_blocking(random.choice(awakening_emotions), duration=3.0)
             else:
                 print("[spirit] The spirit remains...")
@@ -720,6 +752,7 @@ def ouija_session():
 
             # --- Decide whether the spirit remains ---
             print("\n  The spirits have spoken.\n")
+            last_spoken_time = time.time()
             reachy_flush()
             consecutive_questions += 1
             spirit_remained = should_spirit_remain(consecutive_questions)
