@@ -639,10 +639,12 @@ def spell_word(word: str, pause: float = LETTER_PAUSE):
 def should_spirit_remain(consecutive: int) -> bool:
     """Decide whether the spirit remains for another question.
 
-    Phase 1: always remain (100% chance).
-    Future: 100% for questions 1-2, 75% for 3+.
+    - Questions 1-2: always remain (100%)
+    - Questions 3+: 75% chance independently
     """
-    return True
+    if consecutive < 2:
+        return True
+    return random.random() < 0.75
 
 
 # --- Main Session ---
