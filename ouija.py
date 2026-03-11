@@ -78,7 +78,7 @@ SPIRIT_SOUNDS = [
     os.path.join(_SCRIPT_DIR, "cornell.wav"),
     os.path.join(_SCRIPT_DIR, "steve_jobs.wav"),
     os.path.join(_SCRIPT_DIR, "sky_awesome.wav"),
-    os.path.join(_SCRIPT_DIR, "morse1.wav"),
+    # os.path.join(_SCRIPT_DIR, "morse1.wav"),
 ]
 
 _last_sound = None
@@ -579,6 +579,7 @@ def listen_for_question() -> str | None:
             samplerate=sample_rate,
             channels=channels,
             dtype="int16",
+            device=1,  # Reachy Mini Audio
             blocking=True,
         )
 
@@ -789,6 +790,7 @@ def ouija_session():
                 print("The spirits did not hear you. Try again.")
                 spirit_remained = False
                 consecutive_questions = 0
+                last_spoken_time = time.time()
                 reachy_rest()
                 continue
 
