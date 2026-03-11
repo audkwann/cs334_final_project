@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+*** REVERSED ALPHABET MAPPING ***
+
 Ouija Board - A mystical spirit communication interface using a rotating table.
 
 The table spells out responses letter-by-letter as an ancient spirit answers questions.
@@ -77,7 +79,8 @@ def char_to_segment(char: str) -> int:
     if char == "NO":
         return 2
     if 'A' <= char <= 'Z':
-        return ord(char) - ord('A') + 3  # A=3, Z=28
+        # Reversed alphabet mapping: A=28, B=27, ..., Z=3
+        return 28 - (ord(char) - ord('A'))
     return -1  # invalid character
 
 
@@ -90,7 +93,8 @@ def segment_to_label(segment: int) -> str:
     if segment == 2:
         return "NO"
     if 3 <= segment <= 28:
-        return chr(ord('A') + segment - 3)  # A-Z
+        # Reversed alphabet mapping: 3=Z, 28=A
+        return chr(ord('Z') - (segment - 3))
     if segment == 29:
         return "(blank)"
     return "?"
