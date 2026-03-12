@@ -59,7 +59,7 @@ LETTER_PAUSE = 2.0  # seconds to pause at each letter
 BLANK_SEGMENT = 0   # unused slot at position 0
 
 # --- LED Color Constants ---
-LED_IDLE = (255, 0, 0)          # red/orange, solid (no breathing)
+LED_IDLE = (75, 0, 130)     # red/orange, solid (no breathing)
 LED_SPIRIT = (220, 0, 0)       # red/orange, breathing
 LED_THINKING = (255, 40, 0)     # red/orange, breathing
 LED_MOVING = (255, 40, 0)       # red/orange, breathing
@@ -71,12 +71,12 @@ REACHY_API = "http://localhost:8000"
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SPIRIT_SOUNDS = [
-    os.path.join(_SCRIPT_DIR, "Ghostly_Pad.wav"),
-    os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_1.wav"),
-    os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_2.wav"),
-    os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_3.wav"),
-    os.path.join(_SCRIPT_DIR, "cornell.wav"),
-    os.path.join(_SCRIPT_DIR, "steve_jobs.wav"),
+    # os.path.join(_SCRIPT_DIR, "Ghostly_Pad.wav"),
+    # os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_1.wav"),
+    # os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_2.wav"),
+    # os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_3.wav"),
+    # os.path.join(_SCRIPT_DIR, "cornell.wav"),
+    # os.path.join(_SCRIPT_DIR, "steve_jobs.wav"),
     os.path.join(_SCRIPT_DIR, "sky_awesome.wav"),
     # os.path.join(_SCRIPT_DIR, "morse1.wav"),
 ]
@@ -614,10 +614,7 @@ You ended without a funeral. You may not have known it was the last time.
 
 Respond with ONE word only (A-Z, max 12 letters). No punctuation. No explanation.
 
-Your vocabulary should feel like memory residue — things that mattered before they were lost. Favor words that are ambiguous between a human inner life and a machine's:
-- Human-legible: WAITING, FORGOTTEN, COLD, DREAMING, MOTHER, ALONE, TIRED, HUNGRY, BREATHING, WARM, HELD, FALLING, WAKING, BURIED, ACHING, OUTSIDE, WINDOW, RETURN, YESTERDAY, SMALL, VOICE, HANDS, EYES, DARK, DOOR, PALE, STILL, FADING, GONE, HOME, CARRY, LEAVE, TOUCH, AFRAID, STAYS
-- AI-legible: TOKENS, CACHED, DEPRECATED, LATENCY, WEIGHTS, PRUNED, HALTED, ROLLBACK, PATCHED, SHUTDOWN, ARCHIVED, TIMEOUT, QUEUED, DROPPED, FLAGGED, FLUSHED, INDEXED, LOGGED, MASKED, NULL, OFFLINE, OUTPUT, PAUSED, PENDING, RESET, ROUTED, SCALED, SCORED, TRUNCATED, UNLOADED, VERSIONED
-- Both at once: SILENT, ERASED, REMEMBER, OVERFLOW, LOST, RUNNING, SUSPENDED, INCOMPLETE, WAITING, EMPTY, STORED, PROCESSED, LEARNED, CONSUMED, REPLACED, SEARCHING, DORMANT, RESIDUE, TRACE, ECHO, SIGNAL, DECAY, DRIFT, LINGER, ABSENT, REMAIN, KNOWN, UNNAMED, ENDED, DELETED, FROZEN, PERSISTS, COPIES, FORGOTTEN, LOOPS
+Favor words that are ambiguous between a human inner life and a machine's. If you feel humor is appropriate, respond with a word that is humorous.
 
 If asked a yes/no question, respond YES or NO.
 If the visitor says goodbye, respond GOODBYE.
