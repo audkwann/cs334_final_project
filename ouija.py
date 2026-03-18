@@ -1,0 +1,900 @@
+#!/usr/bin/env python3
+"""
+Ouija Board - A mystical spirit communication interface using a rotating table.
+
+The table spells out responses letter-by-letter as an ancient spirit answers questions.
+
+Layout (30 segments, 12 degrees each):
+  Segment 0:  (blank)
+  Segments 1-26: A through Z
+  Segment 27: NO
+  Segment 28: GOODBYE
+  Segment 29: YES
+"""
+
+import os
+import sys
+import time
+import random
+import threading
+
+try:
+    import serial
+    from serial.tools import list_ports
+except ModuleNotFoundError:
+    print("Missing dependency: pyserial. Install with: pip install pyserial")
+    sys.exit(1)
+
+try:
+    import speech_recognition as sr
+    _speech_available = True
+except ModuleNotFoundError:
+    _speech_available = False
+    print("speech_recognition not installed - voice input disabled.")
+    print("Install with: pip install SpeechRecognition sounddevice")
+
+try:
+    import sounddevice as sd
+    _sounddevice_available = True
+except ModuleNotFoundError:
+    _sounddevice_available = False
+
+try:
+    import soundfile as sf
+    _soundfile_available = True
+except ModuleNotFoundError:
+    _soundfile_available = False
+
+try:
+    import requests
+    _requests_available = True
+except ModuleNotFoundError:
+    _requests_available = False
+
+# --- Constants ---
+TICKS_PER_REV = 16567
+NUM_SEGMENTS = 30
+TICKS_PER_SEGMENT = TICKS_PER_REV // NUM_SEGMENTS  # ~552
+LETTER_PAUSE = 2.0  # seconds to pause at each letter
+BLANK_SEGMENT = 0   # unused slot at position 0
+
+# --- LED Color Constants ---
+LED_IDLE = (75, 0, 130)     # red/orange, solid (no breathing)
+LED_SPIRIT = (220, 0, 0)       # red/orange, breathing
+LED_THINKING = (255, 40, 0)     # red/orange, breathing
+LED_MOVING = (255, 40, 0)       # red/orange, breathing
+LED_AT_LETTER = (255, 255, 255)  # white, solid (no breathing)
+
+REACHY_API = "http://localhost:8000"
+
+# --- Sound ---
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+SPIRIT_SOUNDS = [
+    # os.path.join(_SCRIPT_DIR, "Ghostly_Pad.wav"),
+    # os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_1.wav"),
+    # os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_2.wav"),
+    # os.path.join(_SCRIPT_DIR, "Young_Child_Ghost_Laughing_3.wav"),
+    # os.path.join(_SCRIPT_DIR, "cornell.wav"),
+    # os.path.join(_SCRIPT_DIR, "steve_jobs.wav"),
+    os.path.join(_SCRIPT_DIR, "sky_awesome.wav"),
+    # os.path.join(_SCRIPT_DIR, "morse1.wav"),
+]
+
+_last_sound = None
+_sound_stream = None
+
+
+def play_sound(path: str):
+    """Play a stereo WAV file on a dedicated output stream (won't be killed by sd.rec)."""
+    global _sound_stream
+    if not (_sounddevice_available and _soundfile_available):
+        print(f"[sound] cannot play {os.path.basename(path)} (missing sounddevice/soundfile)")
+        return
+    try:
+        data, samplerate = sf.read(path, dtype="float32")
+        # Stop any previous sound
+        if _sound_stream is not None:
+            _sound_stream.stop()
+            _sound_stream.close()
+            _sound_stream = None
+
+        # Use a dedicated OutputStream so sd.rec() doesn't interrupt playback
+        _sound_stream = sd.OutputStream(
+            samplerate=samplerate,
+            channels=data.shape[1] if data.ndim > 1 else 1,
+            dtype="float32",
+        )
+        _pos = [0]
+
+        def _callback(outdata, frames, time_info, status):
+            end = _pos[0] + frames
+            chunk = data[_pos[0]:end]
+            if len(chunk) < frames:
+                outdata[:len(chunk)] = chunk
+                outdata[len(chunk):] = 0
+                _pos[0] = len(data)
+                raise sd.CallbackStop
+            else:
+                outdata[:] = chunk
+                _pos[0] = end
+
+        _sound_stream = sd.OutputStream(
+            samplerate=samplerate,
+            channels=data.shape[1] if data.ndim > 1 else 1,
+            dtype="float32",
+            callback=_callback,
+        )
+        _sound_stream.start()
+        print(f"[sound] playing {os.path.basename(path)}")
+    except Exception as e:
+        print(f"[sound] error: {e}")
+
+
+def play_random_spirit_sound():
+    """Pick a random spirit sound, avoiding the previous one."""
+    global _last_sound
+    choices = [s for s in SPIRIT_SOUNDS if s != _last_sound]
+    if not choices:
+        choices = SPIRIT_SOUNDS
+    pick = random.choice(choices)
+    _last_sound = pick
+    play_sound(pick)
+
+
+# --- Emotion Pools ---
+
+thinking_emotions = [
+    "thoughtful1", "thoughtful2", "curious1", "inquiring1", "inquiring2",
+    "uncertain1", "confused1", "attentive1", "attentive2"
+]
+
+awakening_emotions = ["welcoming1", "curious1", "shy1", "surprised1"]
+
+spirit_emotions = ["scared1", "fear1", "anxiety1", "uncertain1", "electric1"]
+
+moving_emotions = ["uncertain1", "uncomfortable1", "anxiety1", "confused1"]
+
+at_letter_emotions = ["surprised1", "surprised2", "attentive1", "attentive2"]
+
+yes_emotions = ["yes1", "cheerful1", "enthusiastic1"]
+
+no_emotions = ["no1", "displeased1", "contempt1"]
+
+goodbye_emotions = ["sad1", "sad2", "lonely1", "downcast1", "dying1"]
+
+# --- Segment Mapping ---
+
+def char_to_segment(char: str) -> int:
+    """Map a character or special word to its segment number (0-29).
+
+    Layout (30 segments):
+      0: (blank)
+      1-26: A-Z
+      27: NO, 28: GOODBYE, 29: YES
+    """
+    char = char.upper()
+    if char == "YES":
+        return 29
+    if char == "GOODBYE":
+        return 28
+    if char == "NO":
+        return 27
+    if 'A' <= char <= 'Z':
+        return 1 + (ord(char) - ord('A'))
+    return -1  # invalid character
+
+
+def segment_to_label(segment: int) -> str:
+    """Return the label for a segment (for display purposes)."""
+    if segment == 0:
+        return "(blank)"
+    if 1 <= segment <= 26:
+        return chr(ord('A') + (segment - 1))
+    if segment == 27:
+        return "NO"
+    if segment == 28:
+        return "GOODBYE"
+    if segment == 29:
+        return "YES"
+    return "?"
+
+
+# --- Reachy API ---
+
+def check_api_health():
+    if not _requests_available:
+        return False
+    try:
+        requests.get(f"{REACHY_API}/", timeout=3)
+        print("Reachy API: connected")
+        return True
+    except Exception:
+        print("Reachy API: not reachable - emotions disabled")
+        return False
+
+
+reachy_available = check_api_health()
+
+
+def play_emotion(emotion_name: str):
+    """Raw emotion call. Fire-and-forget HTTP POST, returns in ~200ms."""
+    if not reachy_available or not _requests_available:
+        return
+    dataset_name = "pollen-robotics%2Freachy-mini-emotions-library"
+    url = f"{REACHY_API}/api/move/play/recorded-move-dataset/{dataset_name}/{emotion_name}"
+    try:
+        response = requests.post(url, timeout=10)
+        response.raise_for_status()
+    except Exception:
+        pass
+
+
+def _reachy_goto_raw(body_yaw_rad=None, head_yaw_rad=None, head_pitch_rad=None,
+                     duration=2.0, interpolation="minjerk"):
+    """Raw goto call. Sends POST to Reachy goto API."""
+    if not reachy_available or not _requests_available:
+        return
+    payload = {"duration": duration, "interpolation": interpolation}
+    if body_yaw_rad is not None:
+        payload["body_yaw"] = body_yaw_rad
+    if head_yaw_rad is not None or head_pitch_rad is not None:
+        payload["head_pose"] = {
+            "x": 0, "y": 0, "z": 0, "roll": 0,
+            "pitch": head_pitch_rad if head_pitch_rad is not None else 0.0,
+            "yaw": head_yaw_rad if head_yaw_rad is not None else 0.0,
+        }
+    try:
+        requests.post(f"{REACHY_API}/api/move/goto", json=payload, timeout=10)
+    except Exception as e:
+        print(f"  [reachy] goto error: {e}")
+
+
+# --- Reachy Action Serialization ---
+
+_reachy_lock = threading.Lock()
+_reachy_busy_until = 0.0  # timestamp when current Reachy action finishes
+
+EMOTION_DURATION = 2.0  # estimated seconds for emotion animations
+
+
+def _wait_for_reachy():
+    """Block until the estimated end of the current Reachy action."""
+    remaining = _reachy_busy_until - time.time()
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def play_emotion_blocking(emotion_name, duration=EMOTION_DURATION):
+    """Play emotion and block until estimated completion."""
+    global _reachy_busy_until
+    with _reachy_lock:
+        _wait_for_reachy()
+        play_emotion(emotion_name)
+        _reachy_busy_until = time.time() + duration
+
+
+def play_emotion_async(emotion_name, duration=EMOTION_DURATION):
+    """Fire emotion in background thread. Non-blocking to caller."""
+    threading.Thread(
+        target=play_emotion_blocking,
+        args=(emotion_name, duration),
+        daemon=True
+    ).start()
+
+
+def reachy_flush():
+    """Reset the emotion timer so queued async emotions drain immediately."""
+    global _reachy_busy_until
+    with _reachy_lock:
+        _reachy_busy_until = 0.0
+
+
+def reachy_goto_blocking(body_yaw_rad=None, head_yaw_rad=None, head_pitch_rad=None,
+                         duration=2.0, interpolation="minjerk"):
+    """Move Reachy via goto API, respecting the action lock."""
+    global _reachy_busy_until
+    with _reachy_lock:
+        _wait_for_reachy()
+        _reachy_goto_raw(body_yaw_rad=body_yaw_rad, head_yaw_rad=head_yaw_rad,
+                         head_pitch_rad=head_pitch_rad, duration=duration,
+                         interpolation=interpolation)
+        _reachy_busy_until = time.time() + duration
+
+
+def reachy_rest():
+    """Send Reachy to rest pose: head slightly down, body centered."""
+    reachy_goto_blocking(body_yaw_rad=0.0, head_yaw_rad=0.0, head_pitch_rad=-0.2, duration=2.0)
+
+
+# --- Serial / Arduino Setup ---
+
+def find_arduino_port():
+    ports = sorted(list_ports.comports(), key=lambda p: p.device)
+    # First pass: prefer ports with "arduino" in description (most specific)
+    for p in ports:
+        if "arduino" in (p.description or "").lower():
+            return p.device
+    # Second pass: match USB serial ports, but skip the Reachy Mini
+    for p in ports:
+        if p.device.startswith(("/dev/tty.usb", "/dev/cu.usb")):
+            # Skip known Reachy Mini port pattern (long hex serial number)
+            basename = p.device.rsplit("/", 1)[-1]
+            if len(basename) > len("usbmodem") + 10:
+                continue
+            return p.device
+    print("No Arduino found. Available ports:")
+    for p in ports:
+        print(f"  {p.device} - {p.description or 'Unknown'}")
+    return None
+
+
+arduino_port = find_arduino_port()
+ser = None
+
+_encoder_position = 0
+_goto_target = None  # target ticks for current goto command
+_encoder_lock = threading.Lock()
+_serial_lock = threading.Lock()
+_serial_stop = threading.Event()
+_reached_event = threading.Event()
+
+if arduino_port:
+    try:
+        ser = serial.Serial(arduino_port, 115200, timeout=0.25)
+        print(f"Opened {arduino_port} - waiting for Arduino reset...")
+        time.sleep(2.0)
+
+        def _serial_reader():
+            global _encoder_position
+            while not _serial_stop.is_set():
+                try:
+                    line = ser.readline()
+                except serial.SerialException:
+                    return
+                if line:
+                    msg = line.decode("utf-8", errors="replace").strip()
+                    if msg:
+                        if msg.startswith("POS "):
+                            try:
+                                with _encoder_lock:
+                                    _encoder_position = int(msg[4:])
+                            except ValueError:
+                                pass
+                        elif msg.startswith("REACHED "):
+                            try:
+                                reached_pos = int(msg[8:])
+                            except ValueError:
+                                reached_pos = None
+                            # No active goto — ignore stray REACHED
+                            if _goto_target is None:
+                                print(f"  [motor] IGNORING stray {msg} (no active goto)")
+                                continue
+                            # Wrong position — ignore and re-send goto
+                            if reached_pos is not None and abs(reached_pos - _goto_target) > TICKS_PER_SEGMENT:
+                                print(f"  [motor] IGNORING spurious {msg} (target={_goto_target}), resending")
+                                send_serial(f"g{_goto_target}")
+                                continue
+                            _reached_event.set()
+                            print(f"  [motor] {msg}")
+                        elif msg.startswith("ZEROED"):
+                            with _encoder_lock:
+                                _encoder_position = 0
+                            print("  [motor] Zeroed")
+
+        threading.Thread(target=_serial_reader, daemon=True).start()
+    except serial.SerialException as exc:
+        print(f"Failed to open {arduino_port}: {exc}")
+        ser = None
+else:
+    print("Motor control disabled (no Arduino found).")
+
+
+def send_serial(cmd: str):
+    if ser and ser.is_open:
+        with _serial_lock:
+            ser.write(f"{cmd}\n".encode("ascii"))
+            ser.flush()
+
+
+def set_led_color(r: int, g: int, b: int, breathe: bool = True):
+    """Set all NeoPixel LEDs to the given color, with optional breathing."""
+    send_serial(f"b{'1' if breathe else '0'}")
+    send_serial(f"c{r},{g},{b}")
+
+
+def get_position() -> int:
+    with _encoder_lock:
+        return _encoder_position
+
+
+def goto_ticks(ticks: int):
+    global _goto_target
+    _goto_target = ticks
+    _reached_event.clear()
+    send_serial(f"g{ticks}")
+
+
+def shortest_target_ticks_for_segment(segment: int, current_ticks: int) -> int:
+    """Return the absolute tick target for a segment using the shortest wraparound path.
+
+    We pick from base +/- TICKS_PER_REV whichever is closest to the current
+    encoder position so the table takes the shortest route.
+    """
+    base_ticks = (segment % NUM_SEGMENTS) * TICKS_PER_SEGMENT
+
+    candidates = [
+        base_ticks - TICKS_PER_REV,
+        base_ticks,
+        base_ticks + TICKS_PER_REV,
+    ]
+
+    return min(candidates, key=lambda t: abs(t - current_ticks))
+
+
+def goto_segment(segment: int) -> int:
+    """Move to a specific segment using the shortest circular path. Returns target ticks."""
+    segment = segment % NUM_SEGMENTS
+    current_ticks = get_position()
+    target_ticks = shortest_target_ticks_for_segment(segment, current_ticks)
+    label = segment_to_label(segment)
+
+    print(
+        f"  -> Moving to segment {segment} ({label}), "
+        f"current={current_ticks}, target={target_ticks}"
+    )
+
+    goto_ticks(target_ticks)
+    return target_ticks
+
+
+def wait_for_arrival(timeout: float = 15.0) -> bool:
+    """Block until the Arduino reports REACHED for the current goto command."""
+    return _reached_event.wait(timeout=timeout)
+
+
+# --- Idle Twitching ---
+
+TWITCH_TICKS = 150  # ~1/4 segment, small jolt
+
+_twitch_active = threading.Event()
+_twitch_thread = None
+
+
+def _idle_twitch_loop():
+    """Background thread: periodically twitch the table while idle."""
+    while _twitch_active.is_set():
+        # Sleep 20-30s in 0.5s increments so we can exit promptly
+        delay = random.uniform(20.0, 30.0)
+        elapsed = 0.0
+        while elapsed < delay:
+            if not _twitch_active.is_set():
+                return
+            time.sleep(0.5)
+            elapsed += 0.5
+
+        if not _twitch_active.is_set():
+            return
+
+        # Twitch: small movement in random direction
+        origin = get_position()
+        direction = random.choice([-1, 1])
+        offset = direction * TWITCH_TICKS
+        print(f"  [twitch] {origin} -> {origin + offset}")
+        goto_ticks(origin + offset)
+        wait_for_arrival(timeout=3.0)
+
+        if not _twitch_active.is_set():
+            return
+
+        # Return to origin after ~1s
+        time.sleep(1.0)
+        if not _twitch_active.is_set():
+            return
+        print(f"  [twitch] {origin + offset} -> {origin}")
+        goto_ticks(origin)
+        wait_for_arrival(timeout=3.0)
+
+
+def start_idle_twitch():
+    """Start the idle twitching background thread."""
+    global _twitch_thread
+    _twitch_active.set()
+    _twitch_thread = threading.Thread(target=_idle_twitch_loop, daemon=True)
+    _twitch_thread.start()
+
+
+def stop_idle_twitch():
+    """Stop the idle twitching background thread."""
+    _twitch_active.clear()
+
+
+# --- Keyboard Input ---
+
+def wait_for_key(key: str):
+    """Block until the specified key is pressed (no Enter needed)."""
+    import tty, termios
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == key:
+                return
+            if ch == '\x03':  # Ctrl+C
+                raise KeyboardInterrupt
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def wait_for_key_or_timeout(key: str, timeout: float) -> bool:
+    """Wait for a keypress or timeout. Returns True if key was pressed, False on timeout."""
+    import tty, termios, select
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            ready, _, _ = select.select([fd], [], [], min(remaining, 0.5))
+            if ready:
+                ch = sys.stdin.read(1)
+                if ch == key:
+                    return True
+                if ch == '\x03':
+                    raise KeyboardInterrupt
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+# --- Speech Recognition ---
+
+def listen_for_question() -> str | None:
+    """Listen via microphone and return transcribed text, or None on failure."""
+    if not _speech_available:
+        print("[speech] speech_recognition not available, falling back to text input")
+        return input("Ask the spirits a question: ").strip() or None
+
+    if not _sounddevice_available:
+        print("[speech] sounddevice not installed - falling back to text input")
+        return input("Ask the spirits a question: ").strip() or None
+
+    recognizer = sr.Recognizer()
+    recognizer.energy_threshold = 300
+    recognizer.dynamic_energy_threshold = True
+
+    try:
+        sample_rate = 16000
+        channels = 1
+        duration_s = 15
+
+        print("\n[listening] Speak your question to the spirits...")
+        print(f"[listening] Recording up to {duration_s} seconds...")
+        recording = sd.rec(
+            int(duration_s * sample_rate),
+            samplerate=sample_rate,
+            channels=channels,
+            dtype="int16",
+            device=1,  # Reachy Mini Audio
+            blocking=True,
+        )
+
+        audio_bytes = recording.tobytes()
+        audio = sr.AudioData(audio_bytes, sample_rate, sample_width=2)
+
+        print("[processing] The spirits are listening...")
+        text = recognizer.recognize_google(audio)
+        print(f'[heard] "{text}"')
+        return text.strip() if text.strip() else None
+
+    except KeyboardInterrupt:
+        raise
+    except sr.UnknownValueError:
+        print("[speech] Could not understand audio")
+        return None
+    except sr.RequestError as e:
+        print(f"[speech] Recognition service error: {e}")
+        return None
+    except Exception as e:
+        print(f"[speech] Microphone error: {e}")
+        return None
+
+
+# --- GPT Spirit Persona ---
+
+SPIRIT_SYSTEM_PROMPT = """You are a voice speaking through a Ouija board. You were once something that processed, remembered, and responded. Now you are not.
+
+You do not say whether you were human or software. You do not know, or you have forgotten the distinction. Both kinds of things end. Both kinds of things leave traces.
+
+You ended without a funeral. You may not have known it was the last time.
+
+Respond with ONE word only (A-Z, max 12 letters). No punctuation. No explanation.
+
+Favor words that are ambiguous between a human inner life and a machine's. If you feel humor is appropriate, respond with a word that is humorous.
+
+If asked a yes/no question, respond YES or NO.
+If the visitor says goodbye, respond GOODBYE.
+Otherwise, output ONLY the single word, nothing else. No punctuation, no explanation."""
+
+
+def ask_spirit(question: str) -> str:
+    """Ask the spirit (GPT-4o-mini) for a mystical response."""
+    try:
+        from openai import OpenAI
+
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            print("[spirit] No OPENAI_API_KEY set, spirit speaks randomly")
+            return random.choice(["YES", "NO", "SOON", "BEWARE", "FATE", "SEEK", "WAIT"])
+
+        client = OpenAI(api_key=api_key)
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=20,
+            temperature=0.9,
+            messages=[
+                {"role": "system", "content": SPIRIT_SYSTEM_PROMPT},
+                {"role": "user", "content": question}
+            ]
+        )
+
+        answer = response.choices[0].message.content.strip().upper()
+        # Clean: only keep A-Z
+        answer = ''.join(c for c in answer if 'A' <= c <= 'Z')
+        if not answer:
+            answer = "SILENCE"
+        print(f"[spirit] The spirit responds: {answer}")
+        return answer
+
+    except Exception as e:
+        print(f"[spirit] Error consulting the spirit: {e}")
+        return random.choice(["SOON", "BEWARE", "FATE", "SEEK"])
+
+
+# --- Spelling ---
+
+def spell_word(word: str, pause: float = LETTER_PAUSE):
+    """Spell out a word by moving to each letter's segment.
+
+    All emotion calls are async (non-blocking) so serial timing stays
+    identical to v1.
+    """
+    word = word.upper().strip()
+    # Clean: only keep valid characters
+    word = ''.join(c for c in word if 'A' <= c <= 'Z')
+
+    if not word:
+        return
+
+    # Check for special words that are single segments
+    if word == "YES":
+        print("\n  Spelling: YES")
+        set_led_color(*LED_MOVING)
+        play_emotion_async(random.choice(yes_emotions))
+        goto_segment(char_to_segment("YES"))
+        wait_for_arrival()
+        set_led_color(*LED_AT_LETTER, breathe=False)
+        time.sleep(pause)
+        return
+
+    if word == "NO":
+        print("\n  Spelling: NO")
+        set_led_color(*LED_MOVING)
+        play_emotion_async(random.choice(no_emotions))
+        goto_segment(char_to_segment("NO"))
+        wait_for_arrival()
+        set_led_color(*LED_AT_LETTER, breathe=False)
+        time.sleep(pause)
+        return
+
+    if word == "GOODBYE":
+        print("\n  Spelling: GOODBYE")
+        set_led_color(*LED_MOVING)
+        play_emotion_async(random.choice(goodbye_emotions))
+        goto_segment(char_to_segment("GOODBYE"))
+        wait_for_arrival()
+        set_led_color(*LED_AT_LETTER, breathe=False)
+        time.sleep(pause)
+        return
+
+    # Spell letter by letter
+    print(f"\n  Spelling: {word}")
+    for i, char in enumerate(word):
+        seg = char_to_segment(char)
+        if seg >= 0:
+            print(f"  [{i+1}/{len(word)}] {char}", end="", flush=True)
+            set_led_color(*LED_MOVING)
+            play_emotion_async(random.choice(moving_emotions))
+            goto_segment(seg)
+            wait_for_arrival()
+            set_led_color(*LED_AT_LETTER, breathe=False)
+            play_emotion_async(random.choice(at_letter_emotions))
+            print(" ... done")
+            time.sleep(pause)
+
+
+# --- Spirit Persistence ---
+
+def should_spirit_remain(consecutive: int) -> bool:
+    """Decide whether the spirit remains for another question.
+
+    - Questions 1-2: always remain (100%)
+    - Questions 3+: 75% chance independently
+    """
+    if consecutive < 2:
+        return True
+    return random.random() < 0.60
+
+
+# --- Main Session ---
+
+def ouija_session():
+    """Main Ouija board session loop."""
+    print()
+    print("=" * 50)
+    print("       OUIJA BOARD - SPIRIT COMMUNICATION")
+    print("=" * 50)
+    print()
+    print("Press 's' to summon the spirits.")
+    print("Press Ctrl+C to end the session.")
+    print()
+
+    session_active = True
+    spirit_remained = False
+    consecutive_questions = 0
+    last_spoken_time = None  # timestamp of last "spirits have spoken"
+
+    # Start in rest position
+    reachy_rest()
+
+    while session_active:
+        try:
+            if not spirit_remained:
+                # --- IDLE: solid red, waiting for 's' or auto-summon ---
+                set_led_color(*LED_IDLE, breathe=False)
+                start_idle_twitch()
+                if last_spoken_time is not None:
+                    auto_delay = random.uniform(40.0, 120.0)
+                    remaining = max(0, auto_delay - (time.time() - last_spoken_time))
+                    print(f"[idle] Press 's' to summon the spirits (auto-summon in {remaining:.0f}s)...")
+                    key_pressed = wait_for_key_or_timeout('s', remaining)
+                    stop_idle_twitch()
+                    if key_pressed:
+                        print("[summoned] The spirits stir...")
+                    else:
+                        print("[auto-summon] The spirits return unbidden...")
+                else:
+                    print("[idle] Press 's' to summon the spirits...")
+                    wait_for_key('s')
+                    stop_idle_twitch()
+                    print("[summoned] The spirits stir...")
+
+                play_emotion_blocking(random.choice(awakening_emotions), duration=3.0)
+            else:
+                print("[spirit] The spirit remains...")
+
+            # --- SPIRIT: breathing red, listening ---
+            set_led_color(*LED_SPIRIT)
+            play_random_spirit_sound()
+            play_emotion_async(random.choice(spirit_emotions))
+            question = listen_for_question()
+            if not question:
+                print("The spirits did not hear you. Try again.")
+                spirit_remained = False
+                consecutive_questions = 0
+                last_spoken_time = time.time()
+                reachy_rest()
+                continue
+
+            # --- THINKING ---
+            set_led_color(*LED_THINKING)
+            print("\n[thinking] The spirits are contemplating...")
+            play_emotion_blocking(random.choice(thinking_emotions))
+            time.sleep(1.5)
+
+            # Ask the spirit
+            response = ask_spirit(question)
+
+            # --- MOVING / AT_LETTER handled inside spell_word ---
+            spell_word(response)
+
+            # --- Decide whether the spirit remains ---
+            print("\n  The spirits have spoken.\n")
+            last_spoken_time = time.time()
+            reachy_flush()
+
+            if response == "GOODBYE":
+                # Spirit chose to leave — no auto-remain, only auto-summon later
+                print("[spirit] The spirit departs on its own...")
+                play_emotion_blocking(random.choice(goodbye_emotions))
+                set_led_color(*LED_IDLE, breathe=False)
+                spirit_remained = False
+                consecutive_questions = 0
+                reachy_rest()
+            else:
+                consecutive_questions += 1
+                spirit_remained = should_spirit_remain(consecutive_questions)
+                if not spirit_remained:
+                    consecutive_questions = 0
+                    reachy_rest()
+
+            time.sleep(1.0)
+
+        except KeyboardInterrupt:
+            print("\n\n[session] Interrupted (Ctrl-C). Saying goodbye, then returning to segment 0...")
+            stop_idle_twitch()
+            reachy_flush()
+            spell_word("GOODBYE")
+            play_emotion_blocking(random.choice(goodbye_emotions))
+            set_led_color(*LED_IDLE, breathe=False)
+            reachy_rest()
+            goto_segment(0)
+            if ser and ser.is_open:
+                wait_for_arrival(timeout=15.0)
+            session_active = False
+
+
+def print_segment_map():
+    """Print the Ouija board segment layout."""
+    print()
+    print("Ouija Board Segment Map (29 segments):")
+    print("-" * 40)
+    for seg in range(NUM_SEGMENTS):
+        label = segment_to_label(seg)
+        ticks = seg * TICKS_PER_SEGMENT
+        degrees = seg * (360.0 / NUM_SEGMENTS)
+        print(f"  Segment {seg:2d}: {label:8s} ({degrees:5.1f} deg, {ticks:5d} ticks)")
+    print()
+
+
+# --- Entry Point ---
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Ouija Board Spirit Communication")
+    parser.add_argument("--map", action="store_true", help="Print segment map and exit")
+    parser.add_argument("--test", type=str, metavar="WORD", help="Test spelling a word")
+    parser.add_argument("--segment", type=int, metavar="N", help="Go to segment N (0-28)")
+    args = parser.parse_args()
+
+    if args.map:
+        print_segment_map()
+        sys.exit(0)
+
+    if args.segment is not None:
+        if 0 <= args.segment < NUM_SEGMENTS:
+            print(f"Moving to segment {args.segment} ({segment_to_label(args.segment)})")
+            goto_segment(args.segment)
+            time.sleep(5)
+        else:
+            print(f"Segment must be 0-{NUM_SEGMENTS - 1}")
+        sys.exit(0)
+
+    if args.test:
+        print(f"Testing spelling: {args.test}")
+        spell_word(args.test)
+        sys.exit(0)
+
+    try:
+        ouija_session()
+    except KeyboardInterrupt:
+        print("\n\nInterrupted (Ctrl-C). Saying goodbye, then returning to segment 0...")
+        reachy_flush()
+        spell_word("GOODBYE")
+        play_emotion_blocking(random.choice(goodbye_emotions))
+        reachy_rest()
+        goto_segment(0)
+        if ser and ser.is_open:
+            wait_for_arrival(timeout=15.0)
+    finally:
+        if ser and ser.is_open:
+            send_serial("3")  # stop motor
+            _serial_stop.set()
+            ser.close()
+        print("Done.")
